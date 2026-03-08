@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -23,6 +24,10 @@ class RepoMount:
     repo_type: str = "model"
     revision: str = "main"
     token_env: str | None = None
+    token: str | None = None
+    discovery_source: str = "anonymous"
+    discovery_status: str = "ok"
+    discovery_message: str = ""
 
 
 @dataclass(frozen=True)
@@ -35,26 +40,27 @@ class ServerConfig:
 class GatewayConfig:
     server: ServerConfig
     repositories: tuple[RepoMount, ...]
+    discover_users: tuple[dict[str, str], ...] = ()
 
 
 def load_config(path: str | Path) -> GatewayConfig:
     raw = _load_yaml_config(path)
 
     server_raw = raw.get("server") or {}
-    repositories_raw = raw.get("repositories") or []
 
     env_server = _load_server_from_env()
-    env_repositories = _load_repositories_from_env()
+    discover_users = _load_repositories_from_env()
 
     if env_server:
         server_raw = {**server_raw, **env_server}
-    if env_repositories:
-        repositories_raw = env_repositories
 
-    repositories = _parse_repositories(repositories_raw) if repositories_raw else []
     server = _parse_server(server_raw)
 
-    return GatewayConfig(server=server, repositories=tuple(repositories))
+    return GatewayConfig(
+        server=server,
+        repositories=tuple(),
+        discover_users=tuple(discover_users),
+    )
 
 
 def _load_yaml_config(path: str | Path) -> dict[str, Any]:
@@ -78,37 +84,36 @@ def _load_server_from_env() -> dict[str, Any]:
     return server
 
 
-def _load_repositories_from_env() -> list[dict[str, Any]]:
+def _load_repositories_from_env() -> list[dict[str, str]]:
     raw = os.getenv("HF_WEBDAV_REPOSITORIES", "").strip()
     if not raw:
         return []
 
-    repositories: list[dict[str, Any]] = []
-    for index, chunk in enumerate(raw.split(";"), start=1):
+    lowered = raw.lower()
+    if lowered in {"0", "false", "no", "off", "disable", "disabled"}:
+        return []
+
+    users: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[;,\r\n]+", raw):
         item = chunk.strip()
         if not item:
             continue
         parts = [part.strip() for part in item.split("|")]
-        if len(parts) < 4:
+        if len(parts) < 1 or len(parts) > 2:
             raise ValueError(
-                "Each HF_WEBDAV_REPOSITORIES item must be 'alias|repo_id|repo_type|revision' "
-                "or 'alias|repo_id|repo_type|revision|token_env'."
+                "HF_WEBDAV_REPOSITORIES now expects token-first entries like 'hf_xxx;hf_yyy', "
+                "and if an entry is not a token it is treated as a username."
             )
 
-        repo: dict[str, Any] = {
-            "alias": parts[0],
-            "repo_id": parts[1],
-            "repo_type": parts[2] or "model",
-            "revision": parts[3] or "main",
-        }
-        if len(parts) >= 5 and parts[4]:
-            repo["token_env"] = parts[4]
-
-        repositories.append(repo)
-
-    if not repositories:
-        raise ValueError("HF_WEBDAV_REPOSITORIES is set but contains no valid repository entries.")
-    return repositories
+        entry_value = parts[0]
+        token = parts[1] if len(parts) == 2 else ""
+        dedupe_key = f"{entry_value.lower()}|{token.lower()}"
+        if dedupe_key in seen:
+            continue
+        users.append({"value": entry_value, "token": token})
+        seen.add(dedupe_key)
+    return users
 
 
 def _parse_server(server_raw: dict[str, Any]) -> ServerConfig:
@@ -116,54 +121,3 @@ def _parse_server(server_raw: dict[str, Any]) -> ServerConfig:
         host=str(server_raw.get("host", "127.0.0.1")).strip() or "127.0.0.1",
         port=int(server_raw.get("port", 8080)),
     )
-
-
-def _parse_repositories(repositories_raw: list[dict[str, Any]]) -> list[RepoMount]:
-    
-    seen_aliases: set[str] = set()
-    repositories: list[RepoMount] = []
-
-    for index, item in enumerate(repositories_raw, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"Repository entry #{index} must be a mapping.")
-
-        alias = str(item.get("alias", "")).strip()
-        repo_id = str(item.get("repo_id", "")).strip()
-        repo_type = str(item.get("repo_type", "model")).strip().lower() or "model"
-        repo_type = REPO_TYPE_ALIASES.get(repo_type, repo_type)
-        revision = str(item.get("revision", "main")).strip() or "main"
-        token_env = item.get("token_env")
-        token_env = str(token_env).strip() if token_env else None
-
-        _validate_alias(alias, index)
-
-        if alias in seen_aliases:
-            raise ValueError(f"Duplicate alias '{alias}' in repository config.")
-        if not repo_id or "/" not in repo_id:
-            raise ValueError(f"Repository '{alias}' must define a valid repo_id like owner/name.")
-        if repo_type not in VALID_REPO_TYPES:
-            raise ValueError(
-                f"Repository '{alias}' has invalid repo_type '{repo_type}'. "
-                f"Expected one of: {', '.join(sorted(VALID_REPO_TYPES))}."
-            )
-
-        repositories.append(
-            RepoMount(
-                alias=alias,
-                repo_id=repo_id,
-                repo_type=repo_type,
-                revision=revision,
-                token_env=token_env,
-            )
-        )
-        seen_aliases.add(alias)
-    return repositories
-
-
-def _validate_alias(alias: str, index: int) -> None:
-    if not alias:
-        raise ValueError(f"Repository entry #{index} is missing alias.")
-    if "/" in alias or "\\" in alias:
-        raise ValueError(f"Repository alias '{alias}' cannot contain path separators.")
-    if alias in {".", ".."}:
-        raise ValueError(f"Repository alias '{alias}' is reserved.")

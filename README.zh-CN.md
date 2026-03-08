@@ -1,5 +1,7 @@
 # Hugging Face WebDAV Gateway 中文说明
 
+[English](README.md)
+
 将一个或多个 Hugging Face 仓库以只读 WebDAV 的形式统一暴露出来。
 
 每个已配置仓库会映射为 WebDAV 根目录下的一个顶级目录，例如：
@@ -41,7 +43,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. 通过 `config.yaml` 或环境变量配置仓库。
+2. 通过 `config.yaml` 配置服务端参数，再通过 `HF_WEBDAV_REPOSITORIES` 发现一个或多个用户的仓库。
 
 编辑 `config.yaml`：
 
@@ -49,12 +51,10 @@ pip install -r requirements.txt
 notepad config.yaml
 ```
 
-或者直接设置环境变量：
+然后填写一个或多个用户条目：
 
 ```bash
-set HF_WEBDAV_HOST=127.0.0.1
-set HF_WEBDAV_PORT=8080
-set HF_WEBDAV_REPOSITORIES=models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main
+set HF_WEBDAV_REPOSITORIES=smanx|hf_xxx;other-user|hf_yyy
 ```
 
 如果访问私有仓库，还可以设置 token：
@@ -81,33 +81,72 @@ http://127.0.0.1:8080/
 http://127.0.0.1:8080/dav
 ```
 
+## 路径结构
+
+自动发现后的固定挂载路径如下：
+
+```text
+/dav/<用户名>/models/<仓库名>
+/dav/<用户名>/datasets/<仓库名>
+/dav/<用户名>/spaces/<仓库名>
+```
+
+例如：
+
+```text
+/dav/smanx/models/my-model
+/dav/smanx/datasets/phoenix-data
+/dav/smanx/spaces/demo-space
+```
+
 ## HF_WEBDAV_REPOSITORIES 参数说明
 
-格式如下：
+现在只保留用户发现模式：
 
 ```text
-alias|repo_id|repo_type|revision[|token_env];alias2|repo_id2|repo_type2|revision2[|token_env2]
+HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 ```
 
-说明：
+多个条目之间支持以下分隔符：
 
-- `alias` - WebDAV 中显示的目录名，例如 `models`
-- `repo_id` - Hugging Face 仓库 ID，格式通常为 `owner/name`
-- `repo_type` - 仓库类型，可选 `model`、`dataset`、`space`，也兼容常见复数写法 `models`、`datasets`、`spaces`
-- `revision` - 分支、tag 或 commit，通常写 `main`
-- `token_env` - 可选，表示从哪个环境变量读取访问 token，例如 `HF_TOKEN`
+- `;`
+- `,`
+- 换行
 
-示例：
+逗号示例：
 
 ```text
-models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main;private-models|your-org/secret-model|model|main|HF_TOKEN
+HF_WEBDAV_REPOSITORIES=hf_xxx,hf_yyy
 ```
 
-这会挂载出：
+换行示例：
 
-- `/dav/models`
-- `/dav/datasets`
-- `/dav/private-models`
+```text
+HF_WEBDAV_REPOSITORIES=hf_xxx
+hf_yyy
+```
+
+程序会优先把 `HF_WEBDAV_REPOSITORIES` 中的每个条目当作 Hugging Face token 处理。如果 token 能成功识别，就自动反查用户名；如果 token 不存在或无效，就把该条目当作用户名处理，并仅查询公开仓库。
+
+- 不需要手动指定 `repo_type`
+- 不需要手动指定路径
+- 不需要手动指定仓库名列表
+- 路径固定为 `/用户名/models/仓库名`、`/用户名/datasets/仓库名`、`/用户名/spaces/仓库名`
+- 支持多个用户名，条目之间可使用 `;`、`,` 或换行分隔
+- 推荐直接写 `token`
+- 如果某个条目不是有效 token，就会按用户名处理
+- 兼容 `用户名|token` 这种写法
+
+如果不想启用自动发现，可以不设置 `HF_WEBDAV_REPOSITORIES`，或者设为以下任意值：
+
+```text
+0
+false
+no
+off
+disable
+disabled
+```
 
 ## 认证说明
 
@@ -139,7 +178,7 @@ set HF_WEBDAV_PASSWORD=change-me
 
 ```bash
 docker build -t hf-webdav-gateway .
-docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=admin -e HF_WEBDAV_REPOSITORIES="models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
+docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=admin -e HF_WEBDAV_REPOSITORIES="hf_xxx;hf_yyy" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
 ```
 
 或使用 Compose：
@@ -170,7 +209,7 @@ docker compose up --build
 推荐配置示例：
 
 ```text
-HF_WEBDAV_REPOSITORIES=models|openai/whisper-large-v3|model|main;spaces-assets|username/my-space-assets|space|main
+HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 HF_WEBDAV_USERNAME=admin
 HF_WEBDAV_PASSWORD=admin
 ```
@@ -179,7 +218,7 @@ HF_WEBDAV_PASSWORD=admin
 
 - 当前实现为只读，不支持上传回 Hugging Face
 - 文件内容通过 `huggingface_hub` 拉取并缓存
-- 若没有配置任何仓库，服务仍可启动，但首页会显示空挂载列表
+- 若启用了 `HF_WEBDAV_REPOSITORIES`，程序会自动发现这些用户的所有可见仓库
 - 若用于生产环境，建议前面加 Nginx / Caddy 等反向代理
 
 ## 后续可扩展方向

@@ -10,6 +10,8 @@ pinned: false
 
 # Hugging Face WebDAV Gateway
 
+[中文说明](README.zh-CN.md)
+
 Expose one or more Hugging Face repositories as a single read-only WebDAV server.
 
 Each configured repository is mounted as a top-level folder:
@@ -50,20 +52,18 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-2. Configure repositories with the tracked `config.yaml` or override them with environment variables.
+2. Configure the server, then let the app discover repositories for one or more Hugging Face users through `HF_WEBDAV_REPOSITORIES`.
 
-Option A: edit the tracked `config.yaml`:
+Option A: edit the tracked `config.yaml` for host and port only:
 
 ```bash
 notepad config.yaml
 ```
 
-Option B: configure everything directly with env vars:
+Then set one or more user entries:
 
 ```bash
-set HF_WEBDAV_HOST=127.0.0.1
-set HF_WEBDAV_PORT=8080
-set HF_WEBDAV_REPOSITORIES=models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main;private-models|your-org/secret-model|model|main|HF_TOKEN
+set HF_WEBDAV_REPOSITORIES=smanx|hf_xxx;other-user|hf_yyy
 ```
 
 3. If needed, export a Hugging Face token for private repositories:
@@ -78,8 +78,8 @@ set HF_TOKEN=hf_xxx
 python run.py --config config.yaml
 ```
 
-If `HF_WEBDAV_REPOSITORIES` is set, it overrides the repository list from `config.yaml`.
-If neither place defines repositories, the service still starts and the homepage shows an empty mount list until you add some.
+Repository discovery is controlled only by `HF_WEBDAV_REPOSITORIES`.
+`config.yaml` no longer defines repository mappings.
 
 5. Connect a WebDAV client to:
 
@@ -87,53 +87,80 @@ If neither place defines repositories, the service still starts and the homepage
 http://127.0.0.1:8080/dav
 ```
 
-## Example Mounts
+## Path Layout
 
-```yaml
-server:
-  host: 127.0.0.1
-  port: 8080
+Discovered repositories are exposed under this fixed structure:
 
-repositories:
-  - alias: models
-    repo_id: openai/whisper-large-v3
-    repo_type: model
-    revision: main
-
-  - alias: datasets
-    repo_id: HuggingFaceFW/fineweb
-    repo_type: dataset
-    revision: main
-
-  - alias: private-models
-    repo_id: your-org/secret-model
-    repo_type: model
-    token_env: HF_TOKEN
+```text
+/dav/<username>/models/<repo-name>
+/dav/<username>/datasets/<repo-name>
+/dav/<username>/spaces/<repo-name>
 ```
 
-`repositories` in `config.yaml` is optional. You can leave it out entirely and define everything with `HF_WEBDAV_REPOSITORIES` later.
+Example:
+
+```text
+/dav/smanx/models/my-model
+/dav/smanx/datasets/phoenix-data
+/dav/smanx/spaces/demo-space
+```
 
 ## Environment Variable Format
 
 - `HF_WEBDAV_HOST` - optional, defaults to `127.0.0.1`
 - `HF_WEBDAV_PORT` - optional, defaults to `8080`
-- `HF_WEBDAV_REPOSITORIES` - full repository list
+- `HF_WEBDAV_REPOSITORIES` - one or more token-first entries separated by `;`, `,`, or new lines
 - `HF_WEBDAV_USERNAME` - optional, defaults to `admin`
 - `HF_WEBDAV_PASSWORD` - optional, defaults to `admin`
 
-`HF_WEBDAV_REPOSITORIES` format:
+Format:
 
 ```text
-alias|repo_id|repo_type|revision[|token_env];alias2|repo_id2|repo_type2|revision2[|token_env2]
+HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 ```
 
-Example:
+These separators are all supported between entries:
 
-```bash
-set HF_WEBDAV_REPOSITORIES=models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main;spaces-assets|my-user/my-space|space|main;private-models|your-org/secret-model|model|main|HF_TOKEN
+- `;`
+- `,`
+- new lines
+
+Example with commas:
+
+```text
+HF_WEBDAV_REPOSITORIES=hf_xxx,hf_yyy
 ```
 
-This lets you fully define multiple `alias` / `repo_id` / `repo_type` / `revision` entries from environment variables alone. Accepted `repo_type` values are `model`, `dataset`, and `space`, and the common plural forms `models`, `datasets`, and `spaces` are normalized automatically.
+Example with new lines:
+
+```text
+HF_WEBDAV_REPOSITORIES=hf_xxx
+hf_yyy
+```
+
+When set, the app first treats each entry as a Hugging Face token. If the token resolves successfully, the username is inferred automatically. If the token does not resolve, the same value is treated as a username and only public repositories are queried.
+
+Behavior:
+
+- You do not specify repository names manually
+- You do not specify `model` / `dataset` / `space` manually
+- You do not specify mount paths manually
+- Paths are always exposed as `/username/models/repo-name`, `/username/datasets/repo-name`, and `/username/spaces/repo-name`
+- Multiple users are supported in one variable, separated by `;`, `,`, or new lines
+- The preferred format is just `token`
+- If an entry is not a valid token, it is treated as a username
+- A compatibility form `username|token` is also accepted
+
+Disable discovery by leaving `HF_WEBDAV_REPOSITORIES` unset, or by setting one of these values:
+
+```text
+0
+false
+no
+off
+disable
+disabled
+```
 
 In Hugging Face Spaces, `HF_WEBDAV_REPOSITORIES` may be stored in either `Variables` or `Secrets`.
 The app reads the single environment variable name `HF_WEBDAV_REPOSITORIES`.
@@ -170,13 +197,13 @@ Build and run locally:
 
 ```bash
 docker build -t hf-webdav-gateway .
-docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=admin -e HF_WEBDAV_REPOSITORIES="models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
+docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=admin -e HF_WEBDAV_REPOSITORIES="hf_xxx;hf_yyy" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
 ```
 
 Authenticated example:
 
 ```bash
-docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=change-me -e HF_WEBDAV_REPOSITORIES="models|openai/whisper-large-v3|model|main" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
+docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=change-me -e HF_WEBDAV_REPOSITORIES="hf_xxx;public-user" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
 ```
 
 Or with Compose:
@@ -198,7 +225,7 @@ This project also works in a Docker Space.
 
 - Keep `Dockerfile` at the repository root
 - Keep the tracked `config.yaml` at the repository root
-- Add Space Variables or Secrets such as `HF_WEBDAV_REPOSITORIES` and `HF_TOKEN`
+- Add Space Variables or Secrets such as `HF_WEBDAV_REPOSITORIES`
 - Add `HF_WEBDAV_USERNAME` and `HF_WEBDAV_PASSWORD` if you want `/dav` protected
 - If you do not set auth variables, the default credentials are still `admin` / `admin`
 - The app auto-detects Space runtime hints and uses `PORT` when Hugging Face injects it
@@ -207,14 +234,14 @@ This project also works in a Docker Space.
 
 Recommended usage in Spaces:
 
-- Put `HF_WEBDAV_REPOSITORIES` in `Secrets` when it contains private repository mappings or anything you do not want shown in the UI
+- Put `HF_WEBDAV_REPOSITORIES` in `Secrets` when you enable discovery for a private account
 - You may also store `HF_WEBDAV_REPOSITORIES` in `Variables` for public mappings
 - If you define the same variable name in both places, Spaces generally injects the `Secret` value
 
 Minimal Space configuration example:
 
 ```text
-HF_WEBDAV_REPOSITORIES=models|openai/whisper-large-v3|model|main;spaces-assets|username/my-space-assets|space|main
+HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 ```
 
 ## Notes

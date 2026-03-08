@@ -24,6 +24,7 @@ def _log_startup() -> None:
         f"[startup] repos_env_set={bool(os.getenv('HF_WEBDAV_REPOSITORIES', '').strip())}",
         flush=True,
     )
+    print(f"[startup] repos_env={os.getenv('HF_WEBDAV_REPOSITORIES', '')}", flush=True)
 
 
 from hf_webdav_gateway.server import main
