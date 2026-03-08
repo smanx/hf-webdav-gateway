@@ -1,0 +1,10 @@
+{
+  "include": [
+    "run.py",
+    "src"
+  ],
+  "extraPaths": [
+    "src"
+  ],
+  "reportMissingImports": false
+}

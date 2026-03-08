@@ -1,0 +1,13 @@
+services:
+  hf-webdav-gateway:
+    build: .
+    container_name: hf-webdav-gateway
+    ports:
+      - "8080:7860"
+    environment:
+      HF_WEBDAV_HOST: 0.0.0.0
+      HF_WEBDAV_PORT: 7860
+      HF_WEBDAV_REPOSITORIES: models|openai/whisper-large-v3|model|main;datasets|HuggingFaceFW/fineweb|dataset|main
+    volumes:
+      - ./.hf_cache:/data/hf-home
+    restart: unless-stopped
