@@ -2,24 +2,27 @@
 
 [English](README.md)
 
-将一个或多个 Hugging Face 仓库以只读 WebDAV 的形式统一暴露出来。
+将一个或多个 Hugging Face 仓库通过统一的 WebDAV 服务暴露出来，并根据 token 状态决定是否允许写入。
 
-每个已配置仓库会映射为 WebDAV 根目录下的一个顶级目录，例如：
+自动发现后的仓库会按固定结构暴露为：
 
-- `/dav/models` -> `owner/model-repo`
-- `/dav/datasets` -> `owner/dataset-repo`
-- `/dav/spaces-assets` -> `owner/space-repo`
+- `/dav/<用户名>/models/<仓库名>`
+- `/dav/<用户名>/datasets/<仓库名>`
+- `/dav/<用户名>/spaces/<仓库名>`
 
 适合用 Windows 资源管理器、macOS Finder、rclone、davfs2、OpenList 等 WebDAV 客户端访问 Hugging Face 上的模型、数据集或 Space 文件。
 
 ## 功能特性
 
-- 只读 WebDAV 视图
+- 支持自动发现 Hugging Face 仓库并通过 WebDAV 浏览
 - 支持同时挂载多个 Hugging Face 仓库
 - 支持 `model`、`dataset`、`space` 三种仓库类型
 - 使用本地 Hugging Face 缓存保存下载文件
-- 支持 YAML 或环境变量配置
+- 使用 `HF_WEBDAV_REPOSITORIES` 进行 token-first 自动发现
+- 对带 token 的仓库支持 `PUT` 和 `DELETE`
 - 默认启用 Basic Auth，账号密码为 `admin / admin`
+- 访问首页时自动刷新仓库列表，支持配置定时刷新
+- 首页提供 Space 操作按钮（启动/暂停/重启）
 - 首页 `/` 提供挂载信息展示，WebDAV 实际入口为 `/dav`
 
 ## 项目结构
@@ -51,16 +54,10 @@ pip install -r requirements.txt
 notepad config.yaml
 ```
 
-然后填写一个或多个用户条目：
+然后填写一个或多个 token-first 条目：
 
 ```bash
-set HF_WEBDAV_REPOSITORIES=smanx|hf_xxx;other-user|hf_yyy
-```
-
-如果访问私有仓库，还可以设置 token：
-
-```bash
-set HF_TOKEN=hf_xxx
+set HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy;public-user
 ```
 
 3. 启动服务：
@@ -150,7 +147,7 @@ disabled
 
 ## 认证说明
 
-`/dav` 默认启用 HTTP Basic Auth。
+`/`（首页）和 `/dav`（WebDAV 入口）默认都启用 HTTP Basic Auth。
 
 默认账号密码：
 
@@ -162,15 +159,44 @@ admin / admin
 
 ```bash
 set HF_WEBDAV_USERNAME=admin
-set HF_WEBDAV_PASSWORD=change-me
+set HF_WEBDAV_PASSWORD=admin
 ```
+
+其他环境变量：
+
+- `HF_WEBDAV_REFRESH_INTERVAL` - 可选，自动刷新仓库列表间隔（分钟），默认 `5`
 
 行为说明：
 
-- `/dav` 始终需要账号密码
-- `/` 首页公开可访问
+- `/` 首页需要账号密码
+- `/dav` 需要账号密码
 - `/healthz` 健康检查公开可访问
 - 已显式关闭 WsgiDAV 内置认证，仅使用外层自定义认证
+
+## 写入行为说明
+
+- 所有被网关发现且可见的仓库都可以正常读取和下载
+- `PUT` 与 `DELETE` 只对带 token 的仓库条目生效
+- 仅通过用户名匿名发现出来的仓库仍然是只读
+- `MKCOL` 目前只作为 WebDAV 客户端兼容步骤被接受，Hugging Face 仓库本身仍不支持真正的空目录
+- 写入失败或成功时，日志里会打印 `[webdav-put]`、`[webdav-put-error]`、`[webdav-delete]`、`[webdav-delete-error]`
+
+## Space 操作说明
+
+首页会显示已发现的 Space 仓库及其运行状态，并提供操作按钮：
+
+- **启动** - 启动处于停止/错误状态的 Space
+- **暂停** - 暂停正在运行的 Space
+- **恢复** - 恢复已暂停的 Space
+- **重启** - 重启 Space
+
+注意：Space 操作只对带 token 的仓库生效，匿名发现的仓库不显示操作按钮。
+
+## 自动刷新
+
+仓库列表会自动刷新：
+- 每次访问首页时刷新
+- 按配置的间隔定时刷新，通过 `HF_WEBDAV_REFRESH_INTERVAL` 设置（默认 5 分钟）
 
 ## Docker 运行
 
@@ -216,14 +242,14 @@ HF_WEBDAV_PASSWORD=admin
 
 ## 注意事项
 
-- 当前实现为只读，不支持上传回 Hugging Face
 - 文件内容通过 `huggingface_hub` 拉取并缓存
 - 若启用了 `HF_WEBDAV_REPOSITORIES`，程序会自动发现这些用户的所有可见仓库
+- 如果某个仓库不是通过 token 发现的，则只能读，不能写
 - 若用于生产环境，建议前面加 Nginx / Caddy 等反向代理
 
 ## 后续可扩展方向
 
 - 更细粒度的访问控制
-- 写入支持，映射到 Hugging Face commit API
+- 更完整的 WebDAV 写入兼容能力
 - 元数据缓存 TTL 配置
 - 更丰富的首页状态展示

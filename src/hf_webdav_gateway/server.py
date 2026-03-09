@@ -4,12 +4,14 @@ import argparse
 import base64
 import html
 import os
+import threading
+import time
 from urllib.parse import parse_qs
 from pathlib import Path
 from typing import cast
-from wsgiref.simple_server import make_server
 from wsgiref.util import request_uri
 
+from cheroot.wsgi import Server
 from huggingface_hub import HfApi
 from wsgidav.wsgidav_app import WsgiDAVApp
 
@@ -20,24 +22,95 @@ from hf_webdav_gateway.provider import HfGatewayBackend, HfWebDavProvider
 DISCOVERY_EVENTS: list[dict[str, object]] = []
 REPO_METADATA: dict[str, dict[str, object]] = {}
 
+# 全局变量用于定时刷新
+_backend: HfGatewayBackend | None = None
+_provider: HfWebDavProvider | None = None
+_config_path: str | Path = "config.yaml"
+_refresh_interval: int = 300  # 默认 5 分钟
+_current_mounts: tuple[RepoMount, ...] = tuple()  # 当前最新的 mounts
+
+
+def _refresh_mounts() -> tuple[RepoMount, ...]:
+    """刷新仓库列表，返回最新的 mounts"""
+    global _backend, _provider, DISCOVERY_EVENTS, REPO_METADATA, _current_mounts
+    
+    if _backend is None:
+        return _current_mounts
+    
+    try:
+        config = load_config(_config_path)
+        mounts = _resolve_mounts(config)
+        
+        # 更新 backend 的挂载信息
+        from hf_webdav_gateway.provider import _make_mount_record, _build_children_index
+        _backend.records = [_make_mount_record(mount) for mount in mounts]
+        _backend.mounts_by_root = {record.path_parts: record.mount for record in _backend.records}
+        _backend.children_index = _build_children_index(_backend.records)
+        _backend.list_dir.cache_clear()
+        
+        # 更新全局 mounts
+        _current_mounts = tuple(mounts)
+        
+        total = len(mounts)
+        print(f"[refresh] status=ok repos={total}", flush=True)
+        return _current_mounts
+    except Exception as exc:
+        print(f"[refresh-error] error={exc}", flush=True)
+        return _current_mounts
+
+
+def _refresh_loop() -> None:
+    """后台刷新循环"""
+    while True:
+        time.sleep(_refresh_interval)
+        print("[refresh] starting scheduled refresh...", flush=True)
+        _refresh_mounts()
+
 
 def build_app(config_path: str | Path):
+    global _backend, _provider, _config_path, _refresh_interval
+    
     DISCOVERY_EVENTS.clear()
     REPO_METADATA.clear()
     config = load_config(config_path)
+    _config_path = config_path
+    
+    # 读取刷新间隔配置（分钟）
+    refresh_env = os.getenv("HF_WEBDAV_REFRESH_INTERVAL", "").strip()
+    if refresh_env:
+        try:
+            _refresh_interval = int(refresh_env) * 60  # 转换为秒
+        except ValueError:
+            pass
+    
     mounts = _resolve_mounts(config)
     config = GatewayConfig(server=config.server, repositories=tuple(mounts), discover_users=tuple())
-    backend = HfGatewayBackend(config.repositories)
-    provider = HfWebDavProvider(backend)
+    _current_mounts = config.repositories
+    _backend = HfGatewayBackend(config.repositories)
+    _provider = HfWebDavProvider(_backend)
+
+    # 获取认证用户名和密码
+    username = os.getenv("HF_WEBDAV_USERNAME", "admin").strip() or "admin"
+    password = os.getenv("HF_WEBDAV_PASSWORD", "admin")
 
     dav_app = WsgiDAVApp(
         {
-            "provider_mapping": {"/": provider},
-            "simple_dc": {"user_mapping": {"*": True}},
+            "provider_mapping": {"/": _provider},
+            # 配置 simple_dc 允许写入
+            "simple_dc": {
+                "user_mapping": {
+                    "*": {
+                        username: {
+                            "password": password,
+                            "roles": [],
+                        }
+                    }
+                }
+            },
             "http_authenticator": {
-                "accept_basic": False,
+                "accept_basic": True,
                 "accept_digest": False,
-                "trusted_auth_header": "REMOTE_USER",
+                "trusted_auth_header": None,
             },
             "verbose": 1,
         }
@@ -66,9 +139,28 @@ def main(argv: list[str] | None = None) -> int:
 
     app, host, port = build_app(args.config)
 
-    with make_server(host, port, app) as httpd:
-        print(f"Hugging Face WebDAV gateway listening on http://{host}:{port}/")
-        httpd.serve_forever()
+    # 启动后台刷新线程
+    refresh_thread = threading.Thread(target=_refresh_loop, daemon=True, name="refresh-worker")
+    refresh_thread.start()
+    print(f"[refresh] interval={_refresh_interval // 60} minutes thread=started", flush=True)
+
+    # 使用 cheroot 多线程服务器，支持 100-continue
+    server = Server(
+        bind_addr=(host, port),
+        wsgi_app=app,
+        numthreads=10,
+        max=-1,  # 无限制请求数
+        request_queue_size=20,
+        timeout=300,  # 5 分钟超时
+        shutdown_timeout=5,
+    )
+    
+    print(f"Hugging Face WebDAV gateway listening on http://{host}:{port}/")
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        print("\n[shutdown] received interrupt", flush=True)
+        server.stop()
 
     return 0
 
@@ -82,9 +174,13 @@ class GatewayApp:
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "") or "/"
+        method = (environ.get("REQUEST_METHOD", "GET") or "GET").upper()
         if path == "/space-action":
             return self._handle_space_action(environ, start_response)
         if path == "/":
+            # 首页也需要认证
+            if self._auth_enabled() and not self._is_authorized(environ):
+                return self._unauthorized(start_response)
             return self._serve_home(environ, start_response)
         if path == "/healthz":
             body = b"ok\n"
@@ -94,13 +190,21 @@ class GatewayApp:
             )
             return [body]
         if path.startswith("/dav"):
+            if method in {"PROPFIND", "GET", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}:
+                print(f"[webdav-request] method={method} path={path}", flush=True)
             if self._auth_enabled() and not self._is_authorized(environ):
                 return self._unauthorized(start_response)
+            if method == "MKCOL":
+                forwarded_path = path[len("/dav") :] or "/"
+                if self._handle_mkcol(forwarded_path, start_response):
+                    return []
+            
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
             forwarded["SCRIPT_NAME"] = f"{environ.get('SCRIPT_NAME', '')}/dav".rstrip("/")
             forwarded_path = path[len("/dav") :] or "/"
             forwarded["PATH_INFO"] = forwarded_path
+            
             return self.dav_app(forwarded, start_response)
 
         body = b"Not Found\n"
@@ -111,6 +215,9 @@ class GatewayApp:
         return [body]
 
     def _serve_home(self, environ, start_response):
+        # 访问首页时刷新仓库列表
+        _refresh_mounts()
+        
         language = _detect_language(environ)
         text = _get_home_text(language)
         title = cast(str, text["title"])
@@ -149,9 +256,10 @@ class GatewayApp:
         dav_url = f"{base_url}/dav"
         auth_status = auth_enabled if self._auth_enabled() else auth_disabled
         issues = [event for event in DISCOVERY_EVENTS if event.get("severity") == "error"]
+        # 使用刷新后的最新仓库列表
         rows = "\n".join(
             _render_repo_row(mount, text, DISCOVERY_EVENTS, start_label, pause_label, resume_label, restart_label)
-            for mount in self.config.repositories
+            for mount in _current_mounts
         )
         body = f"""<!doctype html>
 <html lang=\"{html.escape(language)}\">
@@ -248,8 +356,16 @@ class GatewayApp:
     .meta-v {{ overflow-wrap: anywhere; }}
     .meta-v code, .repo-sub code {{ white-space: pre-wrap; }}
     .actions {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-    .actions form {{ margin: 0; }}
-    .actions button {{ padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,0.9); color: var(--ink); cursor: pointer; }}
+    .actions button {{ padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,0.9); color: var(--ink); cursor: pointer; transition: all 0.2s; }}
+    .actions button:hover {{ background: rgba(15,118,110,0.1); border-color: var(--accent); }}
+    .actions button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+    .actions button.loading {{ background: rgba(15,118,110,0.15); }}
+    .actions button.success {{ background: rgba(34,197,94,0.2); border-color: #22c55e; }}
+    .actions button.error {{ background: rgba(239,68,68,0.2); border-color: #ef4444; }}
+    .toast {{ position: fixed; bottom: 20px; right: 20px; padding: 12px 20px; border-radius: 12px; color: #fff; font-size: 14px; z-index: 1000; opacity: 0; transform: translateY(20px); transition: all 0.3s; }}
+    .toast.show {{ opacity: 1; transform: translateY(0); }}
+    .toast.success {{ background: #22c55e; }}
+    .toast.error {{ background: #ef4444; }}
     code {{ font-family: "Courier New", monospace; }}
     .hint {{ margin-top: 22px; font-size: 0.96rem; }}
     .path {{ color: var(--accent); font-weight: 700; }}
@@ -278,8 +394,8 @@ class GatewayApp:
       </div>
       <p>{intro.format(path='<code>/</code>', dav='<span class="path">/dav</span>')}</p>
       <div class=\"summary\">
-        <div class=\"chip\"><span class=\"dot\"></span>{html.escape(summary_users.format(count=len({mount.repo_id.split('/', 1)[0] for mount in self.config.repositories})) )}</div>
-        <div class=\"chip\"><span class=\"dot\"></span>{html.escape(summary_repos.format(count=len(self.config.repositories)))}</div>
+        <div class=\"chip\"><span class=\"dot\"></span>{html.escape(summary_users.format(count=len({mount.repo_id.split('/', 1)[0] for mount in _current_mounts})) )}</div>
+        <div class=\"chip\"><span class=\"dot\"></span>{html.escape(summary_repos.format(count=len(_current_mounts)))}</div>
       </div>
       <div class=\"issues\">{_render_issues(issues, issue_title, issue_empty)}</div>
       <div class=\"grid\">
@@ -305,6 +421,61 @@ class GatewayApp:
       <p class=\"hint\">{hint.format(example=html.escape(dav_url) + '/username/models/repository')}</p>
     </section>
   </main>
+  <div id="toast" class="toast"></div>
+  <script>
+    (function() {{
+      var auth = btoa('{html.escape(self.username)}:{html.escape(self.password)}');
+      
+      function showToast(msg, type) {{
+        var toast = document.getElementById('toast');
+        toast.textContent = msg;
+        toast.className = 'toast ' + type + ' show';
+        setTimeout(function() {{ toast.classList.remove('show'); }}, 3000);
+      }}
+      
+      document.querySelectorAll('.action-btn').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          var repo = this.dataset.repo;
+          var action = this.dataset.action;
+          var btnEl = this;
+          
+          if (btnEl.disabled) return;
+          
+          btnEl.disabled = true;
+          btnEl.classList.add('loading');
+          
+          fetch('/space-action?repo_id=' + encodeURIComponent(repo) + '&action=' + action, {{
+            method: 'POST',
+            headers: {{ 'Authorization': 'Basic ' + auth }}
+          }})
+          .then(function(r) {{ return r.text().then(function(t) {{ return {{ ok: r.ok, text: t }}; }}); }})
+          .then(function(result) {{
+            btnEl.classList.remove('loading');
+            if (result.ok) {{
+              btnEl.classList.add('success');
+              showToast(result.text.trim() || 'OK', 'success');
+            }} else {{
+              btnEl.classList.add('error');
+              showToast(result.text.trim() || 'Error', 'error');
+            }}
+            setTimeout(function() {{
+              btnEl.classList.remove('success', 'error');
+              btnEl.disabled = false;
+            }}, 2000);
+          }})
+          .catch(function(e) {{
+            btnEl.classList.remove('loading');
+            btnEl.classList.add('error');
+            showToast('Request failed: ' + e.message, 'error');
+            setTimeout(function() {{
+              btnEl.classList.remove('error');
+              btnEl.disabled = false;
+            }}, 2000);
+          }});
+        }});
+      }});
+    }})();
+  </script>
 </body>
 </html>
 """.encode("utf-8")
@@ -317,6 +488,20 @@ class GatewayApp:
     def _auth_enabled(self) -> bool:
         return True
 
+    def _handle_mkcol(self, forwarded_path: str, start_response) -> bool:
+        normalized = (forwarded_path or "/").rstrip("/") or "/"
+        # 动态计算 repo_roots
+        repo_roots = {
+            f"/{mount.repo_id.split('/', 1)[0]}/{mount.repo_type}s/{mount.repo_id.split('/', 1)[1]}".rstrip("/")
+            for mount in _current_mounts
+        }
+        if normalized in repo_roots or any(normalized.startswith(root + "/") for root in repo_roots):
+            print(f"[webdav-mkcol] path={normalized} status=idempotent-ok", flush=True)
+            start_response("201 Created", [("Content-Length", "0")])
+            return True
+        print(f"[webdav-mkcol] path={normalized} status=passthrough", flush=True)
+        return False
+
     def _handle_space_action(self, environ, start_response):
         if environ.get("REQUEST_METHOD", "GET").upper() != "POST":
             body = b"Method Not Allowed\n"
@@ -328,7 +513,7 @@ class GatewayApp:
         params = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=False)
         repo_id = (params.get("repo_id") or [""])[0].strip()
         action = (params.get("action") or [""])[0].strip().lower()
-        mount = next((item for item in self.config.repositories if item.repo_id == repo_id and item.repo_type == "space"), None)
+        mount = next((item for item in _current_mounts if item.repo_id == repo_id and item.repo_type == "space"), None)
         if not repo_id or mount is None:
             body = b"Unknown Space repository\n"
             start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))])
@@ -412,6 +597,16 @@ def _render_repo_row(
     runtime_stage = str(metadata.get("runtime_stage", "-"))
     repo_size = str(metadata.get("repo_size", "-"))
     runtime_lower = runtime_stage.lower()
+    alias_label = cast(str, text["alias"])
+    revision_label = cast(str, text["revision"])
+    webdav_path_label = cast(str, text["webdav_path"])
+    hf_link_label = cast(str, text["hf_link_label"])
+    runtime_status_label = cast(str, text["runtime_status_label"])
+    repo_size_label = cast(str, text["repo_size_label"])
+    discovery_status_label = cast(str, text["discovery_status"])
+    discovery_source_label = cast(str, text["discovery_source"])
+    discovery_message_label = cast(str, text["discovery_message"])
+    space_actions_label = cast(str, text["space_actions"])
     status = "ok"
     source = "anonymous"
     message = ""
@@ -424,24 +619,25 @@ def _render_repo_row(
     if repo_type == "space" and mount.token:
         escaped_repo_id = html.escape(repo_id)
         action_buttons = [
-            f'<form method="post" action="/space-action?repo_id={escaped_repo_id}&action=restart"><button type="submit">{html.escape(restart_label)}</button></form>'
+            f'<button type="button" class="action-btn" data-repo="{escaped_repo_id}" data-action="restart">{html.escape(restart_label)}</button>'
         ]
         if runtime_lower in {"paused", "sleeping", "stopped", "suspended"}:
             action_buttons.insert(
                 0,
-                f'<form method="post" action="/space-action?repo_id={escaped_repo_id}&action=resume"><button type="submit">{html.escape(resume_label)}</button></form>',
+                f'<button type="button" class="action-btn" data-repo="{escaped_repo_id}" data-action="resume">{html.escape(resume_label)}</button>',
             )
         else:
             action_buttons.insert(
                 0,
-                f'<form method="post" action="/space-action?repo_id={escaped_repo_id}&action=pause"><button type="submit">{html.escape(pause_label)}</button></form>',
+                f'<button type="button" class="action-btn" data-repo="{escaped_repo_id}" data-action="pause">{html.escape(pause_label)}</button>',
             )
             if runtime_lower in {"-", "build", "building", "no_app_file", "runtime_error", "error"}:
                 action_buttons.insert(
                     0,
-                    f'<form method="post" action="/space-action?repo_id={escaped_repo_id}&action=start"><button type="submit">{html.escape(start_label)}</button></form>',
+                    f'<button type="button" class="action-btn" data-repo="{escaped_repo_id}" data-action="start">{html.escape(start_label)}</button>',
                 )
         actions = f'<div class="actions">{"".join(action_buttons)}</div>'
+    repo_link_html = f'<a href="{html.escape(repo_url)}" target="_blank" rel="noreferrer">{html.escape(repo_url)}</a>'
     return (
         '<article class="repo-card">'
         '<div class="repo-head">'
@@ -452,16 +648,16 @@ def _render_repo_row(
         f'<span class="pill">{html.escape(type_labels.get(repo_type, repo_type))}</span>'
         '</div>'
         '<div class="repo-meta">'
-        f'{_meta_item(alias_label := cast(str, text["alias"]), f"<code>{html.escape(username)}</code>")}'
-        f'{_meta_item(revision_label := cast(str, text["revision"]), f"<code>{html.escape(revision)}</code>")}'
-        f'{_meta_item(webdav_path_label := cast(str, text["webdav_path"]), f"<code>{html.escape(dav_path)}</code>")}'
-        f'{_meta_item(hf_link_label := cast(str, text["hf_link_label"]), f"<a href=\"{html.escape(repo_url)}\" target=\"_blank\" rel=\"noreferrer\">{html.escape(repo_url)}</a>")}'
-        f'{_meta_item(runtime_status_label := cast(str, text["runtime_status_label"]), html.escape(runtime_stage))}'
-        f'{_meta_item(repo_size_label := cast(str, text["repo_size_label"]), html.escape(repo_size))}'
-        f'{_meta_item(discovery_status_label := cast(str, text["discovery_status"]), html.escape(status_labels.get(status, status)))}'
-        f'{_meta_item(discovery_source_label := cast(str, text["discovery_source"]), html.escape(source_labels.get(source, source)))}'
-        f'{_meta_item(discovery_message_label := cast(str, text["discovery_message"]), html.escape(message or "-"))}'
-        f'{_meta_item(space_actions_label := cast(str, text["space_actions"]), actions or "-")}'
+        f'{_meta_item(alias_label, f"<code>{html.escape(username)}</code>")}'
+        f'{_meta_item(revision_label, f"<code>{html.escape(revision)}</code>")}'
+        f'{_meta_item(webdav_path_label, f"<code>{html.escape(dav_path)}</code>")}'
+        f'{_meta_item(hf_link_label, repo_link_html)}'
+        f'{_meta_item(runtime_status_label, html.escape(runtime_stage))}'
+        f'{_meta_item(repo_size_label, html.escape(repo_size))}'
+        f'{_meta_item(discovery_status_label, html.escape(status_labels.get(status, status)))}'
+        f'{_meta_item(discovery_source_label, html.escape(source_labels.get(source, source)))}'
+        f'{_meta_item(discovery_message_label, html.escape(message or "-"))}'
+        f'{_meta_item(space_actions_label, actions or "-")}'
         '</div>'
         '</article>'
     )

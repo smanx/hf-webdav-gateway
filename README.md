@@ -12,24 +12,27 @@ pinned: false
 
 [中文说明](README.zh-CN.md)
 
-Expose one or more Hugging Face repositories as a single read-only WebDAV server.
+Expose one or more Hugging Face repositories through a single WebDAV server with token-aware read and write behavior.
 
-Each configured repository is mounted as a top-level folder:
+Discovered repositories are exposed through this fixed layout:
 
-- `/models` -> `owner/model-repo`
-- `/datasets` -> `owner/dataset-repo`
-- `/spaces-assets` -> `owner/space-repo`
+- `/dav/<username>/models/<repo-name>`
+- `/dav/<username>/datasets/<repo-name>`
+- `/dav/<username>/spaces/<repo-name>`
 
 This project is useful when you want to browse or download files from Hugging Face
 with any WebDAV client, such as Windows Explorer, macOS Finder, rclone, or davfs2.
 
 ## Features
 
-- Read-only WebDAV view over Hugging Face repositories
+- WebDAV browsing over discovered Hugging Face repositories
 - Multiple repositories mounted at the same time
 - Supports `model`, `dataset`, and `space` repo types
 - Uses the local Hugging Face cache for downloaded files
-- Simple YAML or environment-variable configuration
+- Token-first discovery through `HF_WEBDAV_REPOSITORIES`
+- `PUT` and `DELETE` support for token-backed repositories
+- Auto-refresh repository list on homepage access and configurable interval
+- Space runtime control (start/pause/restart) via homepage buttons
 
 ## Project Layout
 
@@ -60,19 +63,13 @@ Option A: edit the tracked `config.yaml` for host and port only:
 notepad config.yaml
 ```
 
-Then set one or more user entries:
+Then set one or more token-first entries:
 
 ```bash
-set HF_WEBDAV_REPOSITORIES=smanx|hf_xxx;other-user|hf_yyy
+set HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy;public-user
 ```
 
-3. If needed, export a Hugging Face token for private repositories:
-
-```bash
-set HF_TOKEN=hf_xxx
-```
-
-4. Start the server:
+3. Start the server:
 
 ```bash
 python run.py --config config.yaml
@@ -81,7 +78,7 @@ python run.py --config config.yaml
 Repository discovery is controlled only by `HF_WEBDAV_REPOSITORIES`.
 `config.yaml` no longer defines repository mappings.
 
-5. Connect a WebDAV client to:
+4. Connect a WebDAV client to:
 
 ```text
 http://127.0.0.1:8080/dav
@@ -112,6 +109,7 @@ Example:
 - `HF_WEBDAV_REPOSITORIES` - one or more token-first entries separated by `;`, `,`, or new lines
 - `HF_WEBDAV_USERNAME` - optional, defaults to `admin`
 - `HF_WEBDAV_PASSWORD` - optional, defaults to `admin`
+- `HF_WEBDAV_REFRESH_INTERVAL` - optional, auto-refresh interval in minutes, defaults to `5`
 
 Format:
 
@@ -167,7 +165,7 @@ The app reads the single environment variable name `HF_WEBDAV_REPOSITORIES`.
 
 ## WebDAV Authentication
 
-`/dav` is protected by HTTP Basic Auth by default.
+Both `/` (homepage) and `/dav` (WebDAV endpoint) are protected by HTTP Basic Auth by default.
 
 Default credentials:
 
@@ -179,17 +177,42 @@ Override them with:
 
 ```bash
 set HF_WEBDAV_USERNAME=admin
-set HF_WEBDAV_PASSWORD=change-me
+set HF_WEBDAV_PASSWORD=admin
 ```
 
 Behavior:
 
-- `/dav` always requires username and password
-- `/` stays public so the Space homepage can still explain the mount points
+- `/` (homepage) requires username and password
+- `/dav` requires username and password
 - `/healthz` stays public for simple liveness checks
 - WsgiDAV built-in auth is disabled; only this outer auth layer is used
 
+## Write Behavior
+
+- Reading and downloading work for all discovered repositories that are visible to the gateway
+- `PUT` and `DELETE` require the repository entry to be token-backed
+- Entries discovered anonymously from a username remain read-only
+- `MKCOL` is accepted as a compatibility step for WebDAV clients, but Hugging Face repositories still do not support real empty directories
+- If a write fails, the server logs include `[webdav-put]`, `[webdav-put-error]`, `[webdav-delete]`, or `[webdav-delete-error]`
+
 WebDAV clients should connect to `/dav` and use the configured credentials.
+
+## Space Operations
+
+The homepage displays discovered Space repositories with their runtime status and provides action buttons:
+
+- **Start** - Start a stopped/errored Space
+- **Pause** - Pause a running Space
+- **Resume** - Resume a paused Space
+- **Restart** - Restart a Space
+
+Note: Space operations only work for token-backed repositories. Anonymous entries do not show action buttons.
+
+## Auto Refresh
+
+The repository list is automatically refreshed:
+- On every homepage access
+- At configurable intervals via `HF_WEBDAV_REFRESH_INTERVAL` (default: 5 minutes)
 
 ## Docker
 
@@ -203,7 +226,7 @@ docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=a
 Authenticated example:
 
 ```bash
-docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=change-me -e HF_WEBDAV_REPOSITORIES="hf_xxx;public-user" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
+docker run --rm -p 8080:7860 -e HF_WEBDAV_USERNAME=admin -e HF_WEBDAV_PASSWORD=admin -e HF_WEBDAV_REPOSITORIES="hf_xxx;public-user" -v %cd%/.hf_cache:/data/hf-home hf-webdav-gateway
 ```
 
 Or with Compose:
@@ -246,14 +269,12 @@ HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 
 ## Notes
 
-- The current implementation is read-only on purpose. It focuses on stable browsing and download behavior.
 - File content is fetched through `huggingface_hub` and cached locally.
 - For production exposure, put this behind a reverse proxy such as Nginx or Caddy.
 - Root path `/` is a human-friendly index page; WebDAV clients should connect to `/dav`.
 
 ## Future Extensions
 
-- Basic authentication in front of the WebDAV endpoint
-- Write support using Hugging Face commit APIs
 - Per-repository access control
+- More complete WebDAV write compatibility beyond `PUT` and `DELETE`
 - Optional metadata caching TTL settings

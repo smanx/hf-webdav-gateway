@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import mimetypes
 import os
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Iterable
 
 from huggingface_hub import HfApi, hf_hub_download
+from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_METHOD_NOT_ALLOWED
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 
 from hf_webdav_gateway.config import RepoMount
@@ -42,6 +45,20 @@ class HfGatewayBackend:
         self.records = [_make_mount_record(mount) for mount in mounts]
         self.mounts_by_root = {record.path_parts: record.mount for record in self.records}
         self.children_index = _build_children_index(self.records)
+
+    def invalidate_mount_cache(self, mount_root: tuple[str, str, str]) -> None:
+        self.list_dir.cache_clear()
+        mount = self.mounts_by_root.get(mount_root)
+        if mount is None:
+            return
+        token = self._token_for_mount(mount)
+        if not token:
+            return
+        scan_cache_dir = os.getenv("HF_HOME", "/data/hf-home")
+        try:
+            self.api.scan_cache_dir(cache_dir=scan_cache_dir).delete_revisions()
+        except Exception:
+            pass
 
     def get_root_children(self, prefix: tuple[str, ...]) -> list[str]:
         return self.children_index.get(prefix, [])
@@ -91,18 +108,121 @@ class HfGatewayBackend:
 
     def open_file(self, mount_root: tuple[str, str, str], repo_path: str):
         mount = self.mounts_by_root[mount_root]
+        normalized = _normalize_repo_path(repo_path)
+        print(
+            f"[webdav-get] repo_id={mount.repo_id} path={normalized} status=begin",
+            flush=True,
+        )
         local_path = hf_hub_download(
             repo_id=mount.repo_id,
-            filename=_normalize_repo_path(repo_path),
+            filename=normalized,
             repo_type=mount.repo_type,
             revision=mount.revision,
             token=self._token_for_mount(mount),
+        )
+        print(
+            f"[webdav-get] repo_id={mount.repo_id} path={normalized} status=ok local_path={local_path}",
+            flush=True,
         )
         return open(local_path, "rb")
 
     def guess_content_type(self, repo_path: str) -> str:
         content_type, _ = mimetypes.guess_type(repo_path)
         return content_type or "application/octet-stream"
+
+    def write_file(self, mount_root: tuple[str, str, str], repo_path: str, data: bytes) -> None:
+        mount = self.mounts_by_root[mount_root]
+        normalized = _normalize_repo_path(repo_path)
+        token = self._token_for_mount(mount)
+        if not token:
+            print(
+                f"[webdav-put-error] repo_id={mount.repo_id} path={normalized} reason=missing_token",
+                flush=True,
+            )
+            raise PermissionError("Writing requires a token-backed repository entry.")
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_file.write(data)
+                temp_path = temp_file.name
+            print(
+                f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=uploading",
+                flush=True,
+            )
+            self.api.upload_file(
+                path_or_fileobj=temp_path,
+                path_in_repo=normalized,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Update {normalized} via WebDAV gateway",
+            )
+            self.invalidate_mount_cache(mount_root)
+            print(
+                f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=ok",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[webdav-put-error] repo_id={mount.repo_id} path={normalized} error={exc}",
+                flush=True,
+            )
+            raise
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def delete_path(self, mount_root: tuple[str, str, str], repo_path: str, is_dir: bool) -> None:
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        normalized = _normalize_repo_path(repo_path)
+        if not token:
+            print(
+                f"[webdav-delete-error] repo_id={mount.repo_id} path={normalized} reason=missing_token",
+                flush=True,
+            )
+            raise PermissionError("Deleting requires a token-backed repository entry.")
+
+        try:
+            if is_dir:
+                delete_folder = getattr(self.api, "delete_folder", None)
+                if not callable(delete_folder):
+                    raise NotImplementedError("Directory deletion is not supported by this huggingface_hub version.")
+                delete_folder(
+                    path_in_repo=normalized,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Delete folder {normalized} via WebDAV gateway",
+                )
+            else:
+                delete_file = getattr(self.api, "delete_file", None)
+                if not callable(delete_file):
+                    raise NotImplementedError("File deletion is not supported by this huggingface_hub version.")
+                delete_file(
+                    path_in_repo=normalized,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Delete {normalized} via WebDAV gateway",
+                )
+            self.invalidate_mount_cache(mount_root)
+            print(
+                f"[webdav-delete] repo_id={mount.repo_id} path={normalized} kind={'dir' if is_dir else 'file'} status=ok",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[webdav-delete-error] repo_id={mount.repo_id} path={normalized} kind={'dir' if is_dir else 'file'} error={exc}",
+                flush=True,
+            )
+            raise
 
     def _token_for_mount(self, mount: RepoMount) -> str | None:
         if mount.token:
@@ -119,7 +239,7 @@ class HfWebDavProvider(DAVProvider):
         self.backend = backend
 
     def is_readonly(self) -> bool:
-        return True
+        return False
 
     def get_resource_inst(self, path: str, environ):
         parts = tuple(part for part in path.strip("/").split("/") if part)
@@ -206,6 +326,32 @@ class RepoCollection(DAVCollection):
     def get_etag(self):
         return None
 
+    def create_empty_resource(self, name: str):
+        child_path = _child_webdav_path(self.path, name)
+        child_repo_path = "/".join(part for part in (self.repo_path, name) if part)
+        entry = EntryInfo(name=name, repo_path=child_repo_path, is_dir=False, size=0)
+        return RepoFile(child_path, self.environ, self.provider, self.mount_root, child_repo_path, entry)
+
+    def create_collection(self, name: str):
+        child_path = _child_webdav_path(self.path, name)
+        child_repo_path = "/".join(part for part in (self.repo_path, name) if part)
+        mount = self.provider.backend.mounts_by_root[self.mount_root]
+        print(
+            f"[webdav-mkcol] repo_id={mount.repo_id} path={child_repo_path or '/'} status=accepted",
+            flush=True,
+        )
+        return RepoCollection(child_path, self.environ, self.provider, self.mount_root, child_repo_path)
+
+    def delete(self):
+        if not self.repo_path:
+            raise DAVError(HTTP_METHOD_NOT_ALLOWED, "Repository roots cannot be deleted through WebDAV.")
+        try:
+            self.provider.backend.delete_path(self.mount_root, self.repo_path, is_dir=True)
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc)) from exc
+        except NotImplementedError as exc:
+            raise DAVError(HTTP_METHOD_NOT_ALLOWED, str(exc)) from exc
+
 
 class RepoFile(DAVNonCollection):
     def __init__(
@@ -243,6 +389,40 @@ class RepoFile(DAVNonCollection):
 
     def get_last_modified(self):
         return self.entry.modified
+
+    def begin_write(self, *, content_type=None):
+        return _UploadBuffer(self.provider.backend, self.mount_root, self.repo_path)
+
+    def end_write(self, with_errors: bool) -> None:
+        pass
+
+    def delete(self):
+        try:
+            self.provider.backend.delete_path(self.mount_root, self.repo_path, is_dir=False)
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc)) from exc
+        except NotImplementedError as exc:
+            raise DAVError(HTTP_METHOD_NOT_ALLOWED, str(exc)) from exc
+
+
+class _UploadBuffer(io.BytesIO):
+    def __init__(self, backend: HfGatewayBackend, mount_root: tuple[str, str, str], repo_path: str) -> None:
+        super().__init__()
+        self._backend = backend
+        self._mount_root = mount_root
+        self._repo_path = repo_path
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        data = self.getvalue()
+        super().close()
+        try:
+            self._backend.write_file(self._mount_root, self._repo_path, data)
+        except Exception:
+            raise
 
 
 def _make_mount_record(mount: RepoMount) -> MountRecord:
