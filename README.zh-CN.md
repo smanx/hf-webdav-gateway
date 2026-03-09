@@ -176,6 +176,7 @@ set HF_WEBDAV_PASSWORD=admin
 ## 写入行为说明
 
 - 所有被网关发现且可见的仓库都可以正常读取和下载
+- 所有文件类型的 `GET` 和 `HEAD` 读取都会通过网关从 Hugging Face 流式代理；如果上游支持 `Range`，客户端也会直接受益
 - `PUT` 与 `DELETE` 只对带 token 的仓库条目生效
 - 仅通过用户名匿名发现出来的仓库仍然是只读
 - `MKCOL` 目前只作为 WebDAV 客户端兼容步骤被接受，Hugging Face 仓库本身仍不支持真正的空目录
@@ -242,7 +243,7 @@ HF_WEBDAV_PASSWORD=admin
 
 ## 注意事项
 
-- 文件内容通过 `huggingface_hub` 拉取并缓存
+- 文件读取现在通过 WebDAV 网关从 Hugging Face 流式代理；写入仍会先使用本地临时文件再提交
 - 若启用了 `HF_WEBDAV_REPOSITORIES`，程序会自动发现这些用户的所有可见仓库
 - 如果某个仓库不是通过 token 发现的，则只能读，不能写
 - 若用于生产环境，建议前面加 Nginx / Caddy 等反向代理

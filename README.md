@@ -190,6 +190,7 @@ Behavior:
 ## Write Behavior
 
 - Reading and downloading work for all discovered repositories that are visible to the gateway
+- `GET` and `HEAD` requests are streamed from Hugging Face for all file types, including Range requests when the upstream supports them
 - `PUT` and `DELETE` require the repository entry to be token-backed
 - Entries discovered anonymously from a username remain read-only
 - `MKCOL` is accepted as a compatibility step for WebDAV clients, but Hugging Face repositories still do not support real empty directories
@@ -269,7 +270,7 @@ HF_WEBDAV_REPOSITORIES=hf_xxx;hf_yyy
 
 ## Notes
 
-- File content is fetched through `huggingface_hub` and cached locally.
+- File reads are proxied from Hugging Face through the WebDAV gateway; writes still use temporary local files before commit.
 - For production exposure, put this behind a reverse proxy such as Nginx or Caddy.
 - Root path `/` is a human-friendly index page; WebDAV clients should connect to `/dav`.
 

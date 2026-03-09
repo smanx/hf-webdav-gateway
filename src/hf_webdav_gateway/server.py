@@ -3,16 +3,19 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import mimetypes
 import os
 import threading
 import time
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
+from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import cast
 from wsgiref.util import request_uri
 
 from cheroot.wsgi import Server
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_url
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 from hf_webdav_gateway.config import GatewayConfig, RepoMount, load_config
@@ -28,6 +31,15 @@ _provider: HfWebDavProvider | None = None
 _config_path: str | Path = "config.yaml"
 _refresh_interval: int = 300  # 默认 5 分钟
 _current_mounts: tuple[RepoMount, ...] = tuple()  # 当前最新的 mounts
+PASSTHROUGH_RESPONSE_HEADERS = {
+    "accept-ranges",
+    "cache-control",
+    "content-length",
+    "content-range",
+    "content-type",
+    "etag",
+    "last-modified",
+}
 
 
 def _refresh_mounts() -> tuple[RepoMount, ...]:
@@ -173,7 +185,8 @@ class GatewayApp:
         self.password = os.getenv("HF_WEBDAV_PASSWORD", "admin")
 
     def __call__(self, environ, start_response):
-        path = environ.get("PATH_INFO", "") or "/"
+        raw_path = environ.get("PATH_INFO", "") or "/"
+        path = _normalize_wsgi_path(raw_path)
         method = (environ.get("REQUEST_METHOD", "GET") or "GET").upper()
         if path == "/space-action":
             return self._handle_space_action(environ, start_response)
@@ -194,6 +207,10 @@ class GatewayApp:
                 print(f"[webdav-request] method={method} path={path}", flush=True)
             if self._auth_enabled() and not self._is_authorized(environ):
                 return self._unauthorized(start_response)
+            if method in {"GET", "HEAD"}:
+                streamed = self._maybe_stream_file(path, method, environ, start_response)
+                if streamed is not None:
+                    return streamed
             if method == "MKCOL":
                 forwarded_path = path[len("/dav") :] or "/"
                 if self._handle_mkcol(forwarded_path, start_response):
@@ -501,6 +518,77 @@ class GatewayApp:
             return True
         print(f"[webdav-mkcol] path={normalized} status=passthrough", flush=True)
         return False
+
+    def _maybe_stream_file(self, path: str, method: str, environ, start_response):
+        parsed = _parse_dav_file_request(path)
+        if parsed is None or _backend is None:
+            return None
+        mount_root, repo_path = parsed
+        entry = _backend.get_entry(mount_root, repo_path)
+        if entry is None or entry.is_dir:
+            return None
+
+        mount = _backend.mounts_by_root.get(mount_root)
+        if mount is None:
+            return None
+
+        file_url = hf_hub_url(
+            repo_id=mount.repo_id,
+            filename=repo_path,
+            repo_type=mount.repo_type,
+            revision=mount.revision,
+        )
+        headers = {"User-Agent": "hf-webdav-gateway/1.0"}
+        requested_range = environ.get("HTTP_RANGE", "")
+        if requested_range:
+            headers["Range"] = requested_range
+        token = _token_for_mount(mount)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        print(
+            f"[webdav-stream] repo_id={mount.repo_id} path={repo_path} method={method} range={requested_range or '-'}",
+            flush=True,
+        )
+
+        request = Request(file_url, method=method, headers=headers)
+        try:
+            upstream = urlopen(request, timeout=120)
+        except HTTPError as exc:
+            body = exc.read() if method != "HEAD" else b""
+            message = body if body else f"Upstream media request failed: {exc}".encode("utf-8", errors="replace")
+            start_response(
+                f"{exc.code} {exc.reason}",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(message)))],
+            )
+            print(
+                f"[webdav-stream-error] repo_id={mount.repo_id} path={repo_path} status={exc.code} error={exc}",
+                flush=True,
+            )
+            return [] if method == "HEAD" else [message]
+        except URLError as exc:
+            message = f"Upstream media request failed: {exc}".encode("utf-8", errors="replace")
+            start_response(
+                "502 Bad Gateway",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(message)))],
+            )
+            print(
+                f"[webdav-stream-error] repo_id={mount.repo_id} path={repo_path} status=502 error={exc}",
+                flush=True,
+            )
+            return [message]
+
+        response_headers = _select_passthrough_headers(upstream.headers)
+        if not any(name.lower() == "content-type" for name, _ in response_headers):
+            response_headers.append(("Content-Type", mimetypes.guess_type(repo_path)[0] or "application/octet-stream"))
+        if not any(name.lower() == "accept-ranges" for name, _ in response_headers):
+            response_headers.append(("Accept-Ranges", "bytes"))
+
+        start_response(f"{upstream.status} {upstream.reason}", response_headers)
+        if method == "HEAD":
+            upstream.close()
+            return []
+        return _stream_upstream_response(upstream)
 
     def _handle_space_action(self, environ, start_response):
         if environ.get("REQUEST_METHOD", "GET").upper() != "POST":
@@ -978,6 +1066,54 @@ def _discover_user_mounts(user_entries: tuple[dict[str, str], ...]) -> list[Repo
 def _looks_like_hf_token(value: str) -> bool:
     lowered = value.strip().lower()
     return lowered.startswith("hf_")
+
+
+def _normalize_wsgi_path(path: str) -> str:
+    if not path:
+        return "/"
+    try:
+        return path.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return path
+
+
+def _parse_dav_file_request(path: str) -> tuple[tuple[str, str, str], str] | None:
+    if not path.startswith("/dav"):
+        return None
+    parts = tuple(part for part in path[len("/dav") :].strip("/").split("/") if part)
+    if len(parts) < 4:
+        return None
+    if parts[1] not in {"models", "datasets", "spaces"}:
+        return None
+    return (parts[0], parts[1], parts[2]), "/".join(parts[3:])
+
+
+def _token_for_mount(mount: RepoMount) -> str | None:
+    if mount.token:
+        return mount.token
+    if not mount.token_env:
+        return None
+    token = os.getenv(mount.token_env, "").strip()
+    return token or None
+
+
+def _select_passthrough_headers(headers) -> list[tuple[str, str]]:
+    selected: list[tuple[str, str]] = []
+    for name, value in headers.items():
+        if name.lower() in PASSTHROUGH_RESPONSE_HEADERS:
+            selected.append((name, value))
+    return selected
+
+
+def _stream_upstream_response(upstream, chunk_size: int = 1024 * 256):
+    try:
+        while True:
+            chunk = upstream.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        upstream.close()
 
 
 def _load_repo_metadata(api: HfApi, repo_id: str, repo_type: str, token: str | None) -> dict[str, object]:
