@@ -16,6 +16,7 @@ from wsgiref.util import request_uri
 
 from cheroot.wsgi import Server
 from huggingface_hub import HfApi, hf_hub_url
+from wsgidav import util as wsgidav_util
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 from hf_webdav_gateway.config import GatewayConfig, RepoMount, load_config
@@ -215,12 +216,12 @@ class GatewayApp:
                 forwarded_path = path[len("/dav") :] or "/"
                 if self._handle_mkcol(forwarded_path, start_response):
                     return []
-            
+
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
             forwarded["SCRIPT_NAME"] = f"{environ.get('SCRIPT_NAME', '')}/dav".rstrip("/")
             forwarded_path = path[len("/dav") :] or "/"
-            forwarded["PATH_INFO"] = forwarded_path
+            forwarded["PATH_INFO"] = _to_wsgi_path(forwarded_path)
             
             return self.dav_app(forwarded, start_response)
 
@@ -1074,6 +1075,13 @@ def _normalize_wsgi_path(path: str) -> str:
     try:
         return path.encode("latin-1").decode("utf-8")
     except UnicodeError:
+        return path
+
+
+def _to_wsgi_path(path: str) -> str:
+    try:
+        return wsgidav_util.unicode_to_wsgi(path)
+    except Exception:
         return path
 
 
