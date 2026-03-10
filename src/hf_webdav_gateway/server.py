@@ -9,6 +9,8 @@ import os
 import threading
 import time
 import uuid
+from dataclasses import dataclass
+from pathlib import PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote
 from urllib.request import Request, urlopen
@@ -17,7 +19,8 @@ from typing import cast
 from wsgiref.util import request_uri
 
 from cheroot.wsgi import Server
-from huggingface_hub import HfApi, hf_hub_url
+from huggingface_hub import HfApi, hf_hub_download, hf_hub_url
+from huggingface_hub.errors import RemoteEntryNotFoundError
 from wsgidav import util as wsgidav_util
 from wsgidav.wsgidav_app import WsgiDAVApp
 
@@ -35,14 +38,73 @@ _config_path: str | Path = "config.yaml"
 _refresh_interval: int = 300  # 默认 5 分钟
 _current_mounts: tuple[RepoMount, ...] = tuple()  # 当前最新的 mounts
 
+# Placeholder file used to materialize empty directories.
+PLACEHOLDER_FILE = os.getenv("HF_WEBDAV_PLACEHOLDER_FILE", ".gitkeep").strip() or ".gitkeep"
+
 # Windows WebDAV client may fire MKCOL concurrently/repeatedly.
 # Use per-path locks to avoid redundant placeholder commits.
 _mkcol_locks: dict[str, threading.Lock] = {}
 _mkcol_locks_guard = threading.Lock()
+_mkcol_lock_last_used: dict[str, float] = {}
+_mkcol_locks_last_gc = 0.0
 
 _longop_lock = threading.Semaphore(int(os.getenv("HF_WEBDAV_LONGOP_CONCURRENCY", "2") or "2"))
 _longop_dedupe: set[str] = set()
 _longop_dedupe_guard = threading.Lock()
+
+
+def _normalize_repo_path_for_key(path: str) -> str:
+    text = (path or "").strip().strip("/")
+    if not text:
+        return ""
+    normalized = str(PurePosixPath(text))
+    return "" if normalized == "." else normalized
+
+
+def _strip_dav_prefix(path: str) -> str:
+    if not path:
+        return "/"
+    if path == "/dav":
+        return "/"
+    if path.startswith("/dav/"):
+        return path[len("/dav") :]
+    return path
+
+
+@dataclass(frozen=True)
+class _RepoRequest:
+    mount_root: tuple[str, str, str]
+    mount: RepoMount
+    token: str
+    repo_path: str
+
+
+def _parse_repo_request(forwarded_path: str) -> _RepoRequest | None:
+    """Parse a /dav forwarded path into mount + repo_path."""
+    if _backend is None:
+        return None
+    raw = forwarded_path or "/"
+    normalized = (raw or "/").lstrip("/")
+    parts = tuple(part for part in normalized.split("/") if part)
+    if len(parts) < 4:
+        return None
+    mount_root = (parts[0], parts[1], parts[2])
+    mount = _backend.mounts_by_root.get(mount_root)
+    if mount is None:
+        return None
+    token = _token_for_mount(mount) or ""
+    repo_path = "/".join(parts[3:])
+    return _RepoRequest(mount_root=mount_root, mount=mount, token=token, repo_path=repo_path)
+
+
+def _parse_destination(environ) -> tuple[str, tuple[str, ...]] | None:
+    dest_header = environ.get("HTTP_DESTINATION", "") or ""
+    dest_path = _normalize_destination_path(dest_header)
+    if not dest_path:
+        return None
+    dest_forwarded = _strip_dav_prefix(dest_path)
+    dest_parts = tuple(part for part in dest_forwarded.strip("/").split("/") if part)
+    return dest_header, dest_parts
 PASSTHROUGH_RESPONSE_HEADERS = {
     "accept-ranges",
     "cache-control",
@@ -223,7 +285,7 @@ class GatewayApp:
             # Handle DELETE directly to avoid wsgidav's recursive traversal,
             # which can be fragile against eventual consistency on HF Hub.
             if method == "DELETE":
-                forwarded_path = path[len("/dav") :] or "/"
+                forwarded_path = _strip_dav_prefix(path)
                 if self._handle_delete(forwarded_path, environ, start_response):
                     return getattr(self, "_delete_response", [])
             if method in {"GET", "HEAD"}:
@@ -231,24 +293,24 @@ class GatewayApp:
                 if streamed is not None:
                     return streamed
             if method == "MKCOL":
-                forwarded_path = path[len("/dav") :] or "/"
+                forwarded_path = _strip_dav_prefix(path)
                 if self._handle_mkcol(forwarded_path, start_response):
                     return getattr(self, '_mkcol_response', [])
 
             if method == "COPY":
-                forwarded_path = path[len("/dav") :] or "/"
+                forwarded_path = _strip_dav_prefix(path)
                 if self._handle_copy(forwarded_path, environ, start_response):
                     return getattr(self, "_copy_response", [])
 
             if method == "MOVE":
-                forwarded_path = path[len("/dav") :] or "/"
+                forwarded_path = _strip_dav_prefix(path)
                 if self._handle_move(forwarded_path, environ, start_response):
                     return getattr(self, "_move_response", [])
 
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
             forwarded["SCRIPT_NAME"] = f"{environ.get('SCRIPT_NAME', '')}/dav".rstrip("/")
-            forwarded_path = path[len("/dav") :] or "/"
+            forwarded_path = _strip_dav_prefix(path)
             forwarded["PATH_INFO"] = _to_wsgi_path(forwarded_path)
             
             return self.dav_app(forwarded, start_response)
@@ -617,8 +679,7 @@ class GatewayApp:
         # Calculate folder path within repo
         folder_path = "/".join(parts[3:]) if len(parts) > 3 else ""
 
-        placeholder_name = os.getenv("HF_WEBDAV_PLACEHOLDER_FILE", ".gitkeep").strip() or ".gitkeep"
-        placeholder_path = f"{folder_path}/{placeholder_name}" if folder_path else placeholder_name
+        placeholder_path = f"{folder_path}/{PLACEHOLDER_FILE}" if folder_path else PLACEHOLDER_FILE
 
         lock_key = f"{mount.repo_type}:{mount.repo_id}:{mount.revision}:{folder_path}"
         with _mkcol_locks_guard:
@@ -626,6 +687,17 @@ class GatewayApp:
             if lock is None:
                 lock = threading.Lock()
                 _mkcol_locks[lock_key] = lock
+            _mkcol_lock_last_used[lock_key] = time.time()
+
+            # Best-effort garbage collection of old locks (throttled).
+            global _mkcol_locks_last_gc
+            now = time.time()
+            if now - _mkcol_locks_last_gc > 60 and len(_mkcol_locks) > 512:
+                expired = [k for k, ts in _mkcol_lock_last_used.items() if now - ts > 1800]
+                for k in expired:
+                    _mkcol_locks.pop(k, None)
+                    _mkcol_lock_last_used.pop(k, None)
+                _mkcol_locks_last_gc = now
 
         # Create the folder by uploading a placeholder file.
         # Note: Due to hiding the placeholder in listings, backend existence checks may be
@@ -646,16 +718,24 @@ class GatewayApp:
                         self._mkcol_response = []
                         return True
 
-                api = HfApi(token=token)
-                api.upload_file(
-                    path_or_fileobj=io.BytesIO(b""),
-                    path_in_repo=placeholder_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Create folder {folder_path or '/'} via WebDAV gateway",
-                )
+                if _backend is not None:
+                    _backend.ensure_placeholder(
+                        mount_root,
+                        placeholder_path,
+                        commit_message=f"Create folder {folder_path or '/'} via WebDAV gateway",
+                    )
+                else:
+                    api = HfApi(token=token)
+                    api.upload_file(
+                        # Prefer backend.ensure_placeholder(); this is a fallback.
+                        path_or_fileobj=b"",
+                        path_in_repo=placeholder_path,
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Create folder {folder_path or '/'} via WebDAV gateway",
+                    )
 
                 if _backend is not None:
                     # Make the new directory visible immediately for follow-up PROPFIND.
@@ -671,8 +751,7 @@ class GatewayApp:
 
             except Exception as exc:
                 # If placeholder already exists, treat MKCOL as idempotent success.
-                message = str(exc).lower()
-                if "already exists" in message or "409" in message or "conflict" in message:
+                if _is_conflict_error(exc):
                     print(
                         f"[webdav-mkcol] repo_id={mount.repo_id} path={folder_path or '/'} status=already-exists",
                         flush=True,
@@ -698,21 +777,14 @@ class GatewayApp:
         Some clients (e.g. openlist) rely on COPY for folder copy and may retry
         aggressively when the server implementation is incomplete.
         """
-        if _backend is None:
+        req = _parse_repo_request(forwarded_path)
+        if req is None or _backend is None:
             return False
-
+        mount_root = req.mount_root
+        mount = req.mount
+        token = req.token
         raw_src = forwarded_path or "/"
-        src_normalized = (raw_src or "/").lstrip("/")
-        src_parts = tuple(part for part in src_normalized.split("/") if part)
-        if len(src_parts) < 4:
-            return False
 
-        mount_root = (src_parts[0], src_parts[1], src_parts[2])
-        mount = _backend.mounts_by_root.get(mount_root)
-        if mount is None:
-            return False
-
-        token = _token_for_mount(mount)
         if not token:
             body = b"Copy requires a token-backed repository entry\n"
             start_response(
@@ -722,9 +794,8 @@ class GatewayApp:
             self._copy_response = [body]
             return True
 
-        dest_header = environ.get("HTTP_DESTINATION", "") or ""
-        dest_path = _normalize_destination_path(dest_header)
-        if not dest_path:
+        dest_info = _parse_destination(environ)
+        if dest_info is None:
             body = b"Missing Destination header\n"
             start_response(
                 "400 Bad Request",
@@ -733,14 +804,7 @@ class GatewayApp:
             self._copy_response = [body]
             return True
 
-        if dest_path.startswith("/dav/"):
-            dest_forwarded = dest_path[len("/dav") :]
-        elif dest_path == "/dav":
-            dest_forwarded = "/"
-        else:
-            dest_forwarded = dest_path
-
-        dest_parts = tuple(part for part in dest_forwarded.strip("/").split("/") if part)
+        dest_header, dest_parts = dest_info
         if len(dest_parts) < 4:
             body = b"Invalid Destination path\n"
             start_response(
@@ -760,7 +824,7 @@ class GatewayApp:
             self._copy_response = [body]
             return True
 
-        src_repo_path = "/".join(src_parts[3:])
+        src_repo_path = req.repo_path
         dest_repo_path = "/".join(dest_parts[3:])
         overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
 
@@ -782,7 +846,10 @@ class GatewayApp:
                 self._copy_response = [body]
                 return True
 
-        op_key = f"copy:{mount.repo_type}:{mount.repo_id}:{mount.revision}:{src_repo_path}->{dest_repo_path}:{int(overwrite)}"
+        op_key = (
+            f"copy:{mount.repo_type}:{mount.repo_id}:{mount.revision}:"
+            f"{_normalize_repo_path_for_key(src_repo_path)}->{_normalize_repo_path_for_key(dest_repo_path)}:{int(overwrite)}"
+        )
         with _longop_dedupe_guard:
             if op_key in _longop_dedupe:
                 start_response("201 Created", [("Content-Length", "0")])
@@ -798,35 +865,63 @@ class GatewayApp:
             entry = _backend.get_entry(mount_root, src_repo_path)
             if entry is not None:
                 src_is_collection = src_is_collection or entry.is_dir
+            elif _backend.get_entry(mount_root, f"{src_repo_path}/{PLACEHOLDER_FILE}") is not None:
+                # Placeholder-only directories may not appear as folder items.
+                src_is_collection = True
 
             if src_is_collection:
                 _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
             else:
-                api = HfApi(token=token)
-                url = hf_hub_url(
-                    repo_id=mount.repo_id,
-                    filename=src_repo_path,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                )
-                with urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=120) as resp:
-                    data = resp.read()
-                api.upload_file(
-                    path_or_fileobj=data,
-                    path_in_repo=dest_repo_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Copy {src_repo_path} to {dest_repo_path} via WebDAV gateway",
-                )
+                copy_file = getattr(_backend, "copy_file", None)
+                if callable(copy_file):
+                    copy_file(mount_root, src_repo_path, dest_repo_path)
+                else:
+                    local_path = hf_hub_download(
+                        repo_id=mount.repo_id,
+                        filename=src_repo_path,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                    )
+                    api = HfApi(token=token)
+                    api.upload_file(
+                        path_or_fileobj=local_path,
+                        path_in_repo=dest_repo_path,
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Copy {src_repo_path} to {dest_repo_path} via WebDAV gateway",
+                    )
 
             start_response("201 Created", [("Content-Length", "0")])
             self._copy_response = []
             dt = int((time.time() - t0) * 1000)
             print(f"[webdav-copy-request] id={request_id} status=ok ms={dt}", flush=True)
             return True
+        except RemoteEntryNotFoundError as exc:
+            # Source missing -> treat as 404
+            body = f"Not found: {exc}\n".encode("utf-8")
+            start_response(
+                "404 Not Found",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-copy-request] id={request_id} status=not-found ms={dt}", flush=True)
+            return True
         except Exception as exc:
+            if _is_conflict_error(exc):
+                body = b"Conflict\n"
+                status = "412 Precondition Failed" if not overwrite else "409 Conflict"
+                start_response(
+                    status,
+                    [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+                )
+                self._copy_response = [body]
+                dt = int((time.time() - t0) * 1000)
+                print(f"[webdav-copy-request] id={request_id} status=conflict ms={dt}", flush=True)
+                return True
             print(
                 f"[webdav-copy-error] repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} error={exc}",
                 flush=True,
@@ -847,21 +942,14 @@ class GatewayApp:
 
     def _handle_delete(self, forwarded_path: str, environ, start_response) -> bool:
         """Handle DELETE directly for repository paths."""
-        if _backend is None:
+        req = _parse_repo_request(forwarded_path)
+        if req is None or _backend is None:
             return False
-
+        mount_root = req.mount_root
+        mount = req.mount
+        token = req.token
         raw_src = forwarded_path or "/"
-        src_normalized = (raw_src or "/").lstrip("/")
-        src_parts = tuple(part for part in src_normalized.split("/") if part)
-        if len(src_parts) < 4:
-            return False
 
-        mount_root = (src_parts[0], src_parts[1], src_parts[2])
-        mount = _backend.mounts_by_root.get(mount_root)
-        if mount is None:
-            return False
-
-        token = _token_for_mount(mount)
         if not token:
             body = b"Delete requires a token-backed repository entry\n"
             start_response(
@@ -871,7 +959,7 @@ class GatewayApp:
             self._delete_response = [body]
             return True
 
-        repo_path = "/".join(src_parts[3:])
+        repo_path = req.repo_path
 
         # Determine resource type.
         is_dir = (raw_src or "").endswith("/")
@@ -892,6 +980,13 @@ class GatewayApp:
             self._delete_response = []
             dt = int((time.time() - t0) * 1000)
             print(f"[webdav-delete-request] id={request_id} status=ok ms={dt}", flush=True)
+            return True
+        except RemoteEntryNotFoundError:
+            # Idempotent delete
+            start_response("204 No Content", [("Content-Length", "0")])
+            self._delete_response = []
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-delete-request] id={request_id} status=missing-ok ms={dt}", flush=True)
             return True
         except PermissionError as exc:
             body = f"{exc}\n".encode("utf-8")
@@ -930,21 +1025,14 @@ class GatewayApp:
         Many clients use MOVE for folder rename/move and may retry aggressively.
         We implement MOVE as copy + delete within the same repository.
         """
-        if _backend is None:
+        req = _parse_repo_request(forwarded_path)
+        if req is None or _backend is None:
             return False
-
+        mount_root = req.mount_root
+        mount = req.mount
+        token = req.token
         raw_src = forwarded_path or "/"
-        src_normalized = (raw_src or "/").lstrip("/")
-        src_parts = tuple(part for part in src_normalized.split("/") if part)
-        if len(src_parts) < 4:
-            return False
 
-        mount_root = (src_parts[0], src_parts[1], src_parts[2])
-        mount = _backend.mounts_by_root.get(mount_root)
-        if mount is None:
-            return False
-
-        token = _token_for_mount(mount)
         if not token:
             body = b"Move requires a token-backed repository entry\n"
             start_response(
@@ -954,9 +1042,8 @@ class GatewayApp:
             self._move_response = [body]
             return True
 
-        dest_header = environ.get("HTTP_DESTINATION", "") or ""
-        dest_path = _normalize_destination_path(dest_header)
-        if not dest_path:
+        dest_info = _parse_destination(environ)
+        if dest_info is None:
             body = b"Missing Destination header\n"
             start_response(
                 "400 Bad Request",
@@ -965,14 +1052,7 @@ class GatewayApp:
             self._move_response = [body]
             return True
 
-        if dest_path.startswith("/dav/"):
-            dest_forwarded = dest_path[len("/dav") :]
-        elif dest_path == "/dav":
-            dest_forwarded = "/"
-        else:
-            dest_forwarded = dest_path
-
-        dest_parts = tuple(part for part in dest_forwarded.strip("/").split("/") if part)
+        dest_header, dest_parts = dest_info
         if len(dest_parts) < 4:
             body = b"Invalid Destination path\n"
             start_response(
@@ -992,7 +1072,7 @@ class GatewayApp:
             self._move_response = [body]
             return True
 
-        src_repo_path = "/".join(src_parts[3:])
+        src_repo_path = req.repo_path
         dest_repo_path = "/".join(dest_parts[3:])
         overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
 
@@ -1014,7 +1094,10 @@ class GatewayApp:
                 self._move_response = [body]
                 return True
 
-        op_key = f"move:{mount.repo_type}:{mount.repo_id}:{mount.revision}:{src_repo_path}->{dest_repo_path}:{int(overwrite)}"
+        op_key = (
+            f"move:{mount.repo_type}:{mount.repo_id}:{mount.revision}:"
+            f"{_normalize_repo_path_for_key(src_repo_path)}->{_normalize_repo_path_for_key(dest_repo_path)}:{int(overwrite)}"
+        )
         with _longop_dedupe_guard:
             if op_key in _longop_dedupe:
                 start_response("201 Created", [("Content-Length", "0")])
@@ -1030,6 +1113,8 @@ class GatewayApp:
             entry = _backend.get_entry(mount_root, src_repo_path)
             if entry is not None:
                 src_is_collection = src_is_collection or entry.is_dir
+            elif _backend.get_entry(mount_root, f"{src_repo_path}/{PLACEHOLDER_FILE}") is not None:
+                src_is_collection = True
 
             if src_is_collection:
                 move = getattr(_backend, "move_folder", None)
@@ -1039,32 +1124,56 @@ class GatewayApp:
                     _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
                     _backend.delete_path(mount_root, src_repo_path, is_dir=True)
             else:
-                api = HfApi(token=token)
-                url = hf_hub_url(
-                    repo_id=mount.repo_id,
-                    filename=src_repo_path,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                )
-                with urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=120) as resp:
-                    data = resp.read()
-                api.upload_file(
-                    path_or_fileobj=data,
-                    path_in_repo=dest_repo_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Move {src_repo_path} to {dest_repo_path} via WebDAV gateway",
-                )
-                _backend.delete_path(mount_root, src_repo_path, is_dir=False)
+                move_file = getattr(_backend, "move_file", None)
+                if callable(move_file):
+                    move_file(mount_root, src_repo_path, dest_repo_path)
+                else:
+                    local_path = hf_hub_download(
+                        repo_id=mount.repo_id,
+                        filename=src_repo_path,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                    )
+                    api = HfApi(token=token)
+                    api.upload_file(
+                        path_or_fileobj=local_path,
+                        path_in_repo=dest_repo_path,
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Move {src_repo_path} to {dest_repo_path} via WebDAV gateway",
+                    )
+                    _backend.delete_path(mount_root, src_repo_path, is_dir=False)
 
             start_response("201 Created", [("Content-Length", "0")])
             self._move_response = []
             dt = int((time.time() - t0) * 1000)
             print(f"[webdav-move-request] id={request_id} status=ok ms={dt}", flush=True)
             return True
+        except RemoteEntryNotFoundError as exc:
+            body = f"Not found: {exc}\n".encode("utf-8")
+            start_response(
+                "404 Not Found",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-move-request] id={request_id} status=not-found ms={dt}", flush=True)
+            return True
         except Exception as exc:
+            if _is_conflict_error(exc):
+                body = b"Conflict\n"
+                status = "412 Precondition Failed" if not overwrite else "409 Conflict"
+                start_response(
+                    status,
+                    [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+                )
+                self._move_response = [body]
+                dt = int((time.time() - t0) * 1000)
+                print(f"[webdav-move-request] id={request_id} status=conflict ms={dt}", flush=True)
+                return True
             print(
                 f"[webdav-move-error] repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} error={exc}",
                 flush=True,
@@ -1703,6 +1812,11 @@ def _normalize_destination_path(value: str) -> str:
     if not text.startswith("/"):
         text = "/" + text
     return unquote(text)
+
+
+def _is_conflict_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("409" in msg) or ("conflict" in msg) or ("already exists" in msg)
 
 
 def _load_repo_metadata(api: HfApi, repo_id: str, repo_type: str, token: str | None) -> dict[str, object]:

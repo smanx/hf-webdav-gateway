@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
 import threading
+import time
 from typing import Iterable
 from urllib.parse import unquote
 
@@ -34,6 +35,9 @@ TYPE_SEGMENTS = {
 
 PLACEHOLDER_FILE = os.getenv("HF_WEBDAV_PLACEHOLDER_FILE", ".gitkeep").strip() or ".gitkeep"
 
+# Keep newly created directories visible for a short period to avoid immediate client retries.
+_OPTIMISTIC_DIR_TTL_SECONDS = int(os.getenv("HF_WEBDAV_OPTIMISTIC_DIR_TTL", "600") or "600")
+
 
 @dataclass(frozen=True)
 class EntryInfo:
@@ -59,11 +63,53 @@ class HfGatewayBackend:
         self.children_index = _build_children_index(self.records)
         # Optimistic directory overlay used to make just-created folders visible
         # immediately (Windows Explorer issues PROPFIND right after MKCOL).
-        self._optimistic_dirs: dict[tuple[tuple[str, str, str], str], set[str]] = {}
+        # Key: (mount_root, parent_repo_path) -> {child_dir_name: last_seen_ts}
+        self._optimistic_dirs: dict[tuple[tuple[str, str, str], str], dict[str, float]] = {}
         self._optimistic_dirs_lock = threading.Lock()
+        self._optimistic_last_gc = 0.0
+        self._last_cache_scan = 0.0
+        self._empty_file_path: str | None = None
+
+    def _get_empty_file_path(self) -> str:
+        """Return a stable local path to an empty file.
+
+        Some huggingface_hub versions are more reliable with file paths than
+        file-like objects for commit operations.
+        """
+        if self._empty_file_path and os.path.exists(self._empty_file_path):
+            return self._empty_file_path
+        # Create once and keep it for the process lifetime.
+        fd, path = tempfile.mkstemp(prefix="hf-webdav-empty-", suffix=".bin")
+        os.close(fd)
+        # Ensure empty
+        try:
+            with open(path, "wb"):
+                pass
+        except Exception:
+            pass
+        self._empty_file_path = path
+        return path
 
     def invalidate_mount_cache(self, mount_root: tuple[str, str, str]) -> None:
         self.list_dir.cache_clear()
+
+        # Best-effort cleanup of optimistic entries for this mount.
+        now = time.time()
+        if now - self._optimistic_last_gc > 60:
+            with self._optimistic_dirs_lock:
+                expired_keys = []
+                for key, entries in self._optimistic_dirs.items():
+                    if key[0] != mount_root:
+                        continue
+                    expired_names = [name for name, ts in entries.items() if now - ts > _OPTIMISTIC_DIR_TTL_SECONDS]
+                    for name in expired_names:
+                        entries.pop(name, None)
+                    if not entries:
+                        expired_keys.append(key)
+                for key in expired_keys:
+                    self._optimistic_dirs.pop(key, None)
+                self._optimistic_last_gc = now
+
         mount = self.mounts_by_root.get(mount_root)
         if mount is None:
             return
@@ -71,10 +117,66 @@ class HfGatewayBackend:
         if not token:
             return
         scan_cache_dir = os.getenv("HF_HOME", "/data/hf-home")
+        # scan_cache_dir can be expensive on large caches; throttle it.
+        if time.time() - float(self._last_cache_scan) > 60:
+            try:
+                self.api.scan_cache_dir(cache_dir=scan_cache_dir).delete_revisions()
+            except Exception:
+                pass
+            self._last_cache_scan = time.time()
+
+    def ensure_placeholder(self, mount_root: tuple[str, str, str], placeholder_path: str, *, commit_message: str) -> None:
+        """Ensure a placeholder file exists.
+
+        HF Hub is git-backed and does not support empty folders. We materialize
+        folders by writing a placeholder file (default: .gitkeep).
+        """
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        if not token:
+            raise PermissionError("Operation requires a token-backed repository entry.")
+
+        path_in_repo = _normalize_repo_path(placeholder_path)
+        if not path_in_repo:
+            raise ValueError("Invalid placeholder path")
+
+        if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
+            try:
+                self.api.create_commit(
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=commit_message,
+                    operations=[
+                        CommitOperationAdd(
+                            path_in_repo=path_in_repo,
+                            path_or_fileobj=self._get_empty_file_path(),
+                        )
+                    ],
+                )
+                return
+            except Exception as exc:
+                if _is_conflict_error(exc):
+                    return
+                raise
+
+        # Fallback: upload_file
         try:
-            self.api.scan_cache_dir(cache_dir=scan_cache_dir).delete_revisions()
-        except Exception:
-            pass
+            self.api.upload_file(
+                # Use a stable local empty file path for best compatibility.
+                path_or_fileobj=self._get_empty_file_path(),
+                path_in_repo=path_in_repo,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=commit_message,
+            )
+        except Exception as exc:
+            if _is_conflict_error(exc):
+                return
+            raise
 
     def get_root_children(self, prefix: tuple[str, ...]) -> list[str]:
         return self.children_index.get(prefix, [])
@@ -120,11 +222,23 @@ class HfGatewayBackend:
         key = (mount_root, normalized)
         optimistic = self._optimistic_dirs.get(key)
         if optimistic:
-            for child in sorted(optimistic):
-                if child in entries:
-                    continue
-                child_path = "/".join(part for part in (normalized, child) if part)
-                entries[child] = EntryInfo(name=child, repo_path=child_path, is_dir=True)
+            now = time.time()
+            expired = [name for name, ts in optimistic.items() if now - ts > _OPTIMISTIC_DIR_TTL_SECONDS]
+            if expired:
+                with self._optimistic_dirs_lock:
+                    current = self._optimistic_dirs.get(key)
+                    if current is not None:
+                        for name in expired:
+                            current.pop(name, None)
+                        if not current:
+                            self._optimistic_dirs.pop(key, None)
+                        optimistic = self._optimistic_dirs.get(key)
+            if optimistic:
+                for child in sorted(optimistic.keys()):
+                    if child in entries:
+                        continue
+                    child_path = "/".join(part for part in (normalized, child) if part)
+                    entries[child] = EntryInfo(name=child, repo_path=child_path, is_dir=True)
         return entries
 
     def mark_dir_created(self, mount_root: tuple[str, str, str], repo_path: str) -> None:
@@ -138,7 +252,7 @@ class HfGatewayBackend:
         name = PurePosixPath(normalized).name
         key = (mount_root, parent)
         with self._optimistic_dirs_lock:
-            self._optimistic_dirs.setdefault(key, set()).add(name)
+            self._optimistic_dirs.setdefault(key, {})[name] = time.time()
         # Ensure follow-up list_dir is not served from an old cache entry.
         self.list_dir.cache_clear()
 
@@ -241,81 +355,120 @@ class HfGatewayBackend:
         )
 
         try:
-            items = list(
-                self.api.list_repo_tree(
-                    repo_id=mount.repo_id,
-                    path_in_repo=src_norm,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    recursive=True,
-                    token=token,
-                )
+            iterator = self.api.list_repo_tree(
+                repo_id=mount.repo_id,
+                path_in_repo=src_norm,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                recursive=True,
+                token=token,
             )
         except RemoteEntryNotFoundError:
-            # Source folder missing: treat as no-op.
             print(
                 f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
                 flush=True,
             )
             return
 
-        file_paths: list[str] = []
-        for item in items:
-            path = getattr(item, "path", "")
-            if not path:
-                continue
-            if _is_directory_item(item):
-                continue
-            file_paths.append(path)
+        max_ops = int(os.getenv("HF_WEBDAV_MAX_COMMIT_OPS", "200") or "200")
 
         # Prefer batch create_commit to avoid N commits for N files.
         if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
             ops = []
-            for src_file_path in file_paths:
-                if src_norm:
-                    relative_path = src_file_path[len(src_norm) :].lstrip("/")
-                else:
-                    relative_path = src_file_path
-                dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
-
-                local_path = hf_hub_download(
-                    repo_id=mount.repo_id,
-                    filename=src_file_path,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                )
-                ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
-
-            # Chunk operations defensively to avoid huge payloads.
-            max_ops = int(os.getenv("HF_WEBDAV_MAX_COMMIT_OPS", "200") or "200")
             committed = 0
-            for i in range(0, len(ops), max_ops):
-                chunk = ops[i : i + max_ops]
-                self.api.create_commit(
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Copy folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
-                    operations=chunk,
-                )
-                committed += len(chunk)
-                if committed < len(ops):
-                    print(
-                        f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} committed={committed}",
-                        flush=True,
+            commits = 0
+            files = 0
+            try:
+                for item in iterator:
+                    src_file_path = getattr(item, "path", "")
+                    if not src_file_path:
+                        continue
+                    if _is_directory_item(item):
+                        continue
+
+                    if src_norm:
+                        relative_path = src_file_path[len(src_norm) :].lstrip("/")
+                    else:
+                        relative_path = src_file_path
+                    dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
+
+                    local_path = hf_hub_download(
+                        repo_id=mount.repo_id,
+                        filename=src_file_path,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
                     )
+                    ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
+                    files += 1
+
+                    if len(ops) >= max_ops:
+                        self.api.create_commit(
+                            repo_id=mount.repo_id,
+                            repo_type=mount.repo_type,
+                            revision=mount.revision,
+                            token=token,
+                            commit_message=f"Copy folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
+                            operations=ops,
+                        )
+                        committed += len(ops)
+                        commits += 1
+                        ops = []
+                        print(
+                            f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} committed={committed}",
+                            flush=True,
+                        )
+
+                if ops:
+                    self.api.create_commit(
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Copy folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
+                        operations=ops,
+                    )
+                    committed += len(ops)
+                    commits += 1
+
+            except RemoteEntryNotFoundError:
+                print(
+                    f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
+                    flush=True,
+                )
+                return
+
             self.invalidate_mount_cache(mount_root)
             print(
-                f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} commits={(len(ops) + max_ops - 1) // max_ops} status=ok",
+                f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={files} commits={commits} status=ok",
                 flush=True,
             )
             return
 
         # Fallback: per-file upload (slower, more commits)
         copied = 0
-        for src_file_path in file_paths:
+        try:
+            iterator = self.api.list_repo_tree(
+                repo_id=mount.repo_id,
+                path_in_repo=src_norm,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                recursive=True,
+                token=token,
+            )
+        except RemoteEntryNotFoundError:
+            print(
+                f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
+                flush=True,
+            )
+            return
+
+        for item in iterator:
+            src_file_path = getattr(item, "path", "")
+            if not src_file_path:
+                continue
+            if _is_directory_item(item):
+                continue
             if src_norm:
                 relative_path = src_file_path[len(src_norm) :].lstrip("/")
             else:
@@ -348,6 +501,113 @@ class HfGatewayBackend:
         print(
             f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={copied} commits={copied} status=ok",
             flush=True,
+        )
+
+    def copy_file(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
+        """Copy a single file within the same repository."""
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        if not token:
+            raise PermissionError("Copying requires a token-backed repository entry.")
+
+        src_norm = _normalize_repo_path(src_repo_path)
+        dest_norm = _normalize_repo_path(dest_repo_path)
+        if not src_norm or not dest_norm:
+            raise ValueError("Invalid source or destination path")
+        if src_norm == dest_norm:
+            return
+
+        local_path = hf_hub_download(
+            repo_id=mount.repo_id,
+            filename=src_norm,
+            repo_type=mount.repo_type,
+            revision=mount.revision,
+            token=token,
+        )
+
+        if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
+            self.api.create_commit(
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
+                operations=[CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path)],
+            )
+        else:
+            self.api.upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=dest_norm,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
+            )
+
+        self.invalidate_mount_cache(mount_root)
+
+    def move_file(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
+        """Move a single file within the same repository.
+
+        Prefer a single create_commit(Add+Delete) when available.
+        """
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        if not token:
+            raise PermissionError("Moving requires a token-backed repository entry.")
+
+        src_norm = _normalize_repo_path(src_repo_path)
+        dest_norm = _normalize_repo_path(dest_repo_path)
+        if not src_norm or not dest_norm:
+            raise ValueError("Invalid source or destination path")
+        if src_norm == dest_norm:
+            return
+
+        local_path = hf_hub_download(
+            repo_id=mount.repo_id,
+            filename=src_norm,
+            repo_type=mount.repo_type,
+            revision=mount.revision,
+            token=token,
+        )
+
+        if CommitOperationAdd is not None and CommitOperationDelete is not None and hasattr(self.api, "create_commit"):
+            self.api.create_commit(
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
+                operations=[
+                    CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path),
+                    CommitOperationDelete(path_in_repo=src_norm),
+                ],
+            )
+        else:
+            self.api.upload_file(
+                path_or_fileobj=local_path,
+                path_in_repo=dest_norm,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
+            )
+            self.delete_path(mount_root, src_norm, is_dir=False)
+
+        self.invalidate_mount_cache(mount_root)
+
+    def ensure_placeholder_dir(self, mount_root: tuple[str, str, str], dir_repo_path: str) -> None:
+        """Ensure a directory remains materialized by placing a placeholder inside."""
+        normalized_dir = _normalize_repo_path(dir_repo_path)
+        if not normalized_dir:
+            return
+        placeholder_path = f"{normalized_dir}/{PLACEHOLDER_FILE}"
+        self.ensure_placeholder(
+            mount_root,
+            placeholder_path,
+            commit_message=f"Keep folder {normalized_dir} via WebDAV gateway",
         )
 
     def move_folder(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
@@ -404,7 +664,7 @@ class HfGatewayBackend:
             )
             return
 
-        ops = []
+        add_ops = []
         for src_file_path in file_paths:
             if src_norm:
                 relative_path = src_file_path[len(src_norm) :].lstrip("/")
@@ -418,36 +678,55 @@ class HfGatewayBackend:
                 revision=mount.revision,
                 token=token,
             )
-            ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
-        # Prefer folder delete op if available
-        try:
-            ops.append(CommitOperationDelete(path_in_repo=src_norm, is_folder=True))  # type: ignore[call-arg]
-        except TypeError:
-            # Older signature: delete each file
-            for src_file_path in file_paths:
-                ops.append(CommitOperationDelete(path_in_repo=src_file_path))
+            add_ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
 
         max_ops = int(os.getenv("HF_WEBDAV_MAX_COMMIT_OPS", "200") or "200")
+        add_commits = 0
         committed = 0
-        for i in range(0, len(ops), max_ops):
-            chunk = ops[i : i + max_ops]
+
+        # Phase 1: add/copy all files first
+        for i in range(0, len(add_ops), max_ops):
+            chunk = add_ops[i : i + max_ops]
             self.api.create_commit(
                 repo_id=mount.repo_id,
                 repo_type=mount.repo_type,
                 revision=mount.revision,
                 token=token,
-                commit_message=f"Move folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
+                commit_message=f"Move folder (copy) {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
                 operations=chunk,
             )
+            add_commits += 1
             committed += len(chunk)
-            if committed < len(ops):
+            if committed < len(add_ops):
                 print(
-                    f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} committed={committed}",
+                    f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} copied={committed}",
                     flush=True,
                 )
+
+        # Phase 2: delete source (prefer folder delete op)
+        delete_ops = []
+        try:
+            delete_ops.append(CommitOperationDelete(path_in_repo=src_norm, is_folder=True))  # type: ignore[call-arg]
+        except TypeError:
+            for src_file_path in file_paths:
+                delete_ops.append(CommitOperationDelete(path_in_repo=src_file_path))
+
+        del_commits = 0
+        for i in range(0, len(delete_ops), max_ops):
+            chunk = delete_ops[i : i + max_ops]
+            self.api.create_commit(
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Move folder (delete) {src_norm or '/'} via WebDAV gateway",
+                operations=chunk,
+            )
+            del_commits += 1
+
         self.invalidate_mount_cache(mount_root)
         print(
-            f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} commits={(len(ops) + max_ops - 1) // max_ops} status=ok",
+            f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} commits={add_commits + del_commits} status=ok",
             flush=True,
         )
 
@@ -509,17 +788,8 @@ class HfGatewayBackend:
                     except Exception:
                         remaining = {}
                     if not remaining:
-                        placeholder_path = f"{parent}/{PLACEHOLDER_FILE}"
                         try:
-                            self.api.upload_file(
-                                path_or_fileobj=io.BytesIO(b""),
-                                path_in_repo=placeholder_path,
-                                repo_id=mount.repo_id,
-                                repo_type=mount.repo_type,
-                                revision=mount.revision,
-                                token=token,
-                                commit_message=f"Keep folder {parent} via WebDAV gateway",
-                            )
+                            self.ensure_placeholder_dir(mount_root, parent)
                         except Exception:
                             # Best-effort: even if this fails, the delete already succeeded.
                             pass
@@ -653,13 +923,9 @@ class RepoCollection(DAVCollection):
         if token:
             placeholder_path = f"{child_repo_path}/{PLACEHOLDER_FILE}" if child_repo_path else f"{name}/{PLACEHOLDER_FILE}"
             try:
-                self.provider.backend.api.upload_file(
-                    path_or_fileobj=io.BytesIO(b""),
-                    path_in_repo=placeholder_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
+                self.provider.backend.ensure_placeholder(
+                    self.mount_root,
+                    placeholder_path,
                     commit_message=f"Create folder {child_repo_path} via WebDAV gateway",
                 )
                 self.provider.backend.list_dir.cache_clear()
@@ -898,6 +1164,11 @@ def _parse_webdav_dest_path(dest_path: str) -> tuple[str, ...]:
     if parts and parts[0] == "dav":
         parts = parts[1:]
     return parts
+
+
+def _is_conflict_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("409" in msg) or ("conflict" in msg) or ("already exists" in msg)
 
 
 def _is_directory_item(item) -> bool:
