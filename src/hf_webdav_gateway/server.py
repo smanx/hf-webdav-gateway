@@ -228,6 +228,11 @@ class GatewayApp:
                 if self._handle_copy(forwarded_path, environ, start_response):
                     return getattr(self, "_copy_response", [])
 
+            if method == "MOVE":
+                forwarded_path = path[len("/dav") :] or "/"
+                if self._handle_move(forwarded_path, environ, start_response):
+                    return getattr(self, "_move_response", [])
+
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
             forwarded["SCRIPT_NAME"] = f"{environ.get('SCRIPT_NAME', '')}/dav".rstrip("/")
@@ -776,7 +781,6 @@ class GatewayApp:
             if src_is_collection:
                 _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
             else:
-                # File copy: download then upload.
                 api = HfApi(token=token)
                 url = hf_hub_url(
                     repo_id=mount.repo_id,
@@ -810,6 +814,141 @@ class GatewayApp:
                 [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
             )
             self._copy_response = [body]
+            return True
+
+    def _handle_move(self, forwarded_path: str, environ, start_response) -> bool:
+        """Handle MOVE request directly for repository paths.
+
+        Many clients use MOVE for folder rename/move and may retry aggressively.
+        We implement MOVE as copy + delete within the same repository.
+        """
+        if _backend is None:
+            return False
+
+        raw_src = forwarded_path or "/"
+        src_normalized = (raw_src or "/").lstrip("/")
+        src_parts = tuple(part for part in src_normalized.split("/") if part)
+        if len(src_parts) < 4:
+            return False
+
+        mount_root = (src_parts[0], src_parts[1], src_parts[2])
+        mount = _backend.mounts_by_root.get(mount_root)
+        if mount is None:
+            return False
+
+        token = _token_for_mount(mount)
+        if not token:
+            body = b"Move requires a token-backed repository entry\n"
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
+            return True
+
+        dest_header = environ.get("HTTP_DESTINATION", "") or ""
+        dest_path = _normalize_destination_path(dest_header)
+        if not dest_path:
+            body = b"Missing Destination header\n"
+            start_response(
+                "400 Bad Request",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
+            return True
+
+        if dest_path.startswith("/dav/"):
+            dest_forwarded = dest_path[len("/dav") :]
+        elif dest_path == "/dav":
+            dest_forwarded = "/"
+        else:
+            dest_forwarded = dest_path
+
+        dest_parts = tuple(part for part in dest_forwarded.strip("/").split("/") if part)
+        if len(dest_parts) < 4:
+            body = b"Invalid Destination path\n"
+            start_response(
+                "400 Bad Request",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
+            return True
+
+        dest_mount_root = (dest_parts[0], dest_parts[1], dest_parts[2])
+        if dest_mount_root != mount_root:
+            body = b"Cross-repository move is not supported\n"
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
+            return True
+
+        src_repo_path = "/".join(src_parts[3:])
+        dest_repo_path = "/".join(dest_parts[3:])
+        overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
+
+        print(
+            "[webdav-move-request] "
+            f"repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite} destination={dest_header}",
+            flush=True,
+        )
+
+        if not overwrite:
+            existing = _backend.get_entry(mount_root, dest_repo_path)
+            if existing is not None:
+                body = b"Destination exists and overwrite is disabled\n"
+                start_response(
+                    "412 Precondition Failed",
+                    [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+                )
+                self._move_response = [body]
+                return True
+
+        try:
+            src_is_collection = (raw_src or "").endswith("/")
+            entry = _backend.get_entry(mount_root, src_repo_path)
+            if entry is not None:
+                src_is_collection = src_is_collection or entry.is_dir
+
+            if src_is_collection:
+                _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
+                _backend.delete_path(mount_root, src_repo_path, is_dir=True)
+            else:
+                api = HfApi(token=token)
+                url = hf_hub_url(
+                    repo_id=mount.repo_id,
+                    filename=src_repo_path,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                )
+                with urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=120) as resp:
+                    data = resp.read()
+                api.upload_file(
+                    path_or_fileobj=data,
+                    path_in_repo=dest_repo_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Move {src_repo_path} to {dest_repo_path} via WebDAV gateway",
+                )
+                _backend.delete_path(mount_root, src_repo_path, is_dir=False)
+
+            start_response("201 Created", [("Content-Length", "0")])
+            self._move_response = []
+            return True
+        except Exception as exc:
+            print(
+                f"[webdav-move-error] repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} error={exc}",
+                flush=True,
+            )
+            body = f"Failed to move: {exc}\n".encode("utf-8")
+            start_response(
+                "500 Internal Server Error",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._move_response = [body]
             return True
 
 
