@@ -8,6 +8,7 @@ import mimetypes
 import os
 import threading
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote
 from urllib.request import Request, urlopen
@@ -38,6 +39,10 @@ _current_mounts: tuple[RepoMount, ...] = tuple()  # 当前最新的 mounts
 # Use per-path locks to avoid redundant placeholder commits.
 _mkcol_locks: dict[str, threading.Lock] = {}
 _mkcol_locks_guard = threading.Lock()
+
+_longop_lock = threading.Semaphore(int(os.getenv("HF_WEBDAV_LONGOP_CONCURRENCY", "2") or "2"))
+_longop_dedupe: set[str] = set()
+_longop_dedupe_guard = threading.Lock()
 PASSTHROUGH_RESPONSE_HEADERS = {
     "accept-ranges",
     "cache-control",
@@ -214,6 +219,13 @@ class GatewayApp:
                 print(f"[webdav-request] method={method} path={path}", flush=True)
             if self._auth_enabled() and not self._is_authorized(environ):
                 return self._unauthorized(start_response)
+
+            # Handle DELETE directly to avoid wsgidav's recursive traversal,
+            # which can be fragile against eventual consistency on HF Hub.
+            if method == "DELETE":
+                forwarded_path = path[len("/dav") :] or "/"
+                if self._handle_delete(forwarded_path, environ, start_response):
+                    return getattr(self, "_delete_response", [])
             if method in {"GET", "HEAD"}:
                 streamed = self._maybe_stream_file(path, method, environ, start_response)
                 if streamed is not None:
@@ -721,7 +733,6 @@ class GatewayApp:
             self._copy_response = [body]
             return True
 
-        # Destination is expected to include /dav prefix. Strip it.
         if dest_path.startswith("/dav/"):
             dest_forwarded = dest_path[len("/dav") :]
         elif dest_path == "/dav":
@@ -753,13 +764,13 @@ class GatewayApp:
         dest_repo_path = "/".join(dest_parts[3:])
         overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
 
+        request_id = uuid.uuid4().hex[:10]
         print(
             "[webdav-copy-request] "
-            f"repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite} destination={dest_header}",
+            f"id={request_id} repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite}",
             flush=True,
         )
 
-        # Precondition check when overwrite is disabled.
         if not overwrite:
             existing = _backend.get_entry(mount_root, dest_repo_path)
             if existing is not None:
@@ -771,8 +782,18 @@ class GatewayApp:
                 self._copy_response = [body]
                 return True
 
+        op_key = f"copy:{mount.repo_type}:{mount.repo_id}:{mount.revision}:{src_repo_path}->{dest_repo_path}:{int(overwrite)}"
+        with _longop_dedupe_guard:
+            if op_key in _longop_dedupe:
+                start_response("201 Created", [("Content-Length", "0")])
+                self._copy_response = []
+                print(f"[webdav-copy-request] id={request_id} status=deduped", flush=True)
+                return True
+            _longop_dedupe.add(op_key)
+
+        t0 = time.time()
+        _longop_lock.acquire()
         try:
-            # Treat trailing slash as a hint that the source is a collection.
             src_is_collection = (raw_src or "").endswith("/")
             entry = _backend.get_entry(mount_root, src_repo_path)
             if entry is not None:
@@ -802,6 +823,8 @@ class GatewayApp:
 
             start_response("201 Created", [("Content-Length", "0")])
             self._copy_response = []
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-copy-request] id={request_id} status=ok ms={dt}", flush=True)
             return True
         except Exception as exc:
             print(
@@ -814,6 +837,91 @@ class GatewayApp:
                 [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
             )
             self._copy_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-copy-request] id={request_id} status=error ms={dt}", flush=True)
+            return True
+        finally:
+            _longop_lock.release()
+            with _longop_dedupe_guard:
+                _longop_dedupe.discard(op_key)
+
+    def _handle_delete(self, forwarded_path: str, environ, start_response) -> bool:
+        """Handle DELETE directly for repository paths."""
+        if _backend is None:
+            return False
+
+        raw_src = forwarded_path or "/"
+        src_normalized = (raw_src or "/").lstrip("/")
+        src_parts = tuple(part for part in src_normalized.split("/") if part)
+        if len(src_parts) < 4:
+            return False
+
+        mount_root = (src_parts[0], src_parts[1], src_parts[2])
+        mount = _backend.mounts_by_root.get(mount_root)
+        if mount is None:
+            return False
+
+        token = _token_for_mount(mount)
+        if not token:
+            body = b"Delete requires a token-backed repository entry\n"
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._delete_response = [body]
+            return True
+
+        repo_path = "/".join(src_parts[3:])
+
+        # Determine resource type.
+        is_dir = (raw_src or "").endswith("/")
+        entry = _backend.get_entry(mount_root, repo_path)
+        if entry is not None:
+            is_dir = entry.is_dir
+
+        request_id = uuid.uuid4().hex[:10]
+        print(
+            f"[webdav-delete-request] id={request_id} repo_id={mount.repo_id} path={repo_path} kind={'dir' if is_dir else 'file'}",
+            flush=True,
+        )
+
+        t0 = time.time()
+        try:
+            _backend.delete_path(mount_root, repo_path, is_dir=is_dir)
+            start_response("204 No Content", [("Content-Length", "0")])
+            self._delete_response = []
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-delete-request] id={request_id} status=ok ms={dt}", flush=True)
+            return True
+        except PermissionError as exc:
+            body = f"{exc}\n".encode("utf-8")
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._delete_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-delete-request] id={request_id} status=forbidden ms={dt}", flush=True)
+            return True
+        except NotImplementedError as exc:
+            body = f"{exc}\n".encode("utf-8")
+            start_response(
+                "405 Method Not Allowed",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._delete_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-delete-request] id={request_id} status=not-allowed ms={dt}", flush=True)
+            return True
+        except Exception as exc:
+            body = f"Failed to delete: {exc}\n".encode("utf-8")
+            start_response(
+                "500 Internal Server Error",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._delete_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-delete-request] id={request_id} status=error ms={dt}", flush=True)
             return True
 
     def _handle_move(self, forwarded_path: str, environ, start_response) -> bool:
@@ -888,9 +996,10 @@ class GatewayApp:
         dest_repo_path = "/".join(dest_parts[3:])
         overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
 
+        request_id = uuid.uuid4().hex[:10]
         print(
             "[webdav-move-request] "
-            f"repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite} destination={dest_header}",
+            f"id={request_id} repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite}",
             flush=True,
         )
 
@@ -905,6 +1014,17 @@ class GatewayApp:
                 self._move_response = [body]
                 return True
 
+        op_key = f"move:{mount.repo_type}:{mount.repo_id}:{mount.revision}:{src_repo_path}->{dest_repo_path}:{int(overwrite)}"
+        with _longop_dedupe_guard:
+            if op_key in _longop_dedupe:
+                start_response("201 Created", [("Content-Length", "0")])
+                self._move_response = []
+                print(f"[webdav-move-request] id={request_id} status=deduped", flush=True)
+                return True
+            _longop_dedupe.add(op_key)
+
+        t0 = time.time()
+        _longop_lock.acquire()
         try:
             src_is_collection = (raw_src or "").endswith("/")
             entry = _backend.get_entry(mount_root, src_repo_path)
@@ -912,8 +1032,12 @@ class GatewayApp:
                 src_is_collection = src_is_collection or entry.is_dir
 
             if src_is_collection:
-                _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
-                _backend.delete_path(mount_root, src_repo_path, is_dir=True)
+                move = getattr(_backend, "move_folder", None)
+                if callable(move):
+                    move(mount_root, src_repo_path, dest_repo_path)
+                else:
+                    _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
+                    _backend.delete_path(mount_root, src_repo_path, is_dir=True)
             else:
                 api = HfApi(token=token)
                 url = hf_hub_url(
@@ -937,6 +1061,8 @@ class GatewayApp:
 
             start_response("201 Created", [("Content-Length", "0")])
             self._move_response = []
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-move-request] id={request_id} status=ok ms={dt}", flush=True)
             return True
         except Exception as exc:
             print(
@@ -949,7 +1075,13 @@ class GatewayApp:
                 [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
             )
             self._move_response = [body]
+            dt = int((time.time() - t0) * 1000)
+            print(f"[webdav-move-request] id={request_id} status=error ms={dt}", flush=True)
             return True
+        finally:
+            _longop_lock.release()
+            with _longop_dedupe_guard:
+                _longop_dedupe.discard(op_key)
 
 
     def _maybe_stream_file(self, path: str, method: str, environ, start_response):

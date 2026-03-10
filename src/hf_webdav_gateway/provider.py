@@ -16,6 +16,13 @@ from huggingface_hub.errors import RemoteEntryNotFoundError
 from wsgidav.dav_error import DAVError, HTTP_BAD_REQUEST, HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, HTTP_METHOD_NOT_ALLOWED
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 
+try:
+    # Optional: batch commit API (preferred for large COPY/MOVE)
+    from huggingface_hub import CommitOperationAdd, CommitOperationDelete  # type: ignore
+except Exception:  # pragma: no cover
+    CommitOperationAdd = None  # type: ignore
+    CommitOperationDelete = None  # type: ignore
+
 from hf_webdav_gateway.config import RepoMount
 
 
@@ -252,20 +259,68 @@ class HfGatewayBackend:
             )
             return
 
-        copied = 0
+        file_paths: list[str] = []
         for item in items:
-            src_file_path = getattr(item, "path", "")
-            if not src_file_path:
+            path = getattr(item, "path", "")
+            if not path:
                 continue
             if _is_directory_item(item):
                 continue
+            file_paths.append(path)
 
+        # Prefer batch create_commit to avoid N commits for N files.
+        if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
+            ops = []
+            for src_file_path in file_paths:
+                if src_norm:
+                    relative_path = src_file_path[len(src_norm) :].lstrip("/")
+                else:
+                    relative_path = src_file_path
+                dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
+
+                local_path = hf_hub_download(
+                    repo_id=mount.repo_id,
+                    filename=src_file_path,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                )
+                ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
+
+            # Chunk operations defensively to avoid huge payloads.
+            max_ops = int(os.getenv("HF_WEBDAV_MAX_COMMIT_OPS", "200") or "200")
+            committed = 0
+            for i in range(0, len(ops), max_ops):
+                chunk = ops[i : i + max_ops]
+                self.api.create_commit(
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Copy folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
+                    operations=chunk,
+                )
+                committed += len(chunk)
+                if committed < len(ops):
+                    print(
+                        f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} committed={committed}",
+                        flush=True,
+                    )
+            self.invalidate_mount_cache(mount_root)
+            print(
+                f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} commits={(len(ops) + max_ops - 1) // max_ops} status=ok",
+                flush=True,
+            )
+            return
+
+        # Fallback: per-file upload (slower, more commits)
+        copied = 0
+        for src_file_path in file_paths:
             if src_norm:
                 relative_path = src_file_path[len(src_norm) :].lstrip("/")
             else:
                 relative_path = src_file_path
             dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
-
             local_path = hf_hub_download(
                 repo_id=mount.repo_id,
                 filename=src_file_path,
@@ -273,11 +328,8 @@ class HfGatewayBackend:
                 revision=mount.revision,
                 token=token,
             )
-            with open(local_path, "rb") as f:
-                data = f.read()
-
             self.api.upload_file(
-                path_or_fileobj=data,
+                path_or_fileobj=local_path,
                 path_in_repo=dest_file_path,
                 repo_id=mount.repo_id,
                 repo_type=mount.repo_type,
@@ -294,7 +346,108 @@ class HfGatewayBackend:
 
         self.invalidate_mount_cache(mount_root)
         print(
-            f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={copied} status=ok",
+            f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={copied} commits={copied} status=ok",
+            flush=True,
+        )
+
+    def move_folder(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
+        """Recursively move a folder inside the same repository.
+
+        Implemented as a single (or chunked) create_commit with add + delete.
+        """
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        if not token:
+            raise PermissionError("Moving requires a token-backed repository entry.")
+
+        src_norm = _normalize_repo_path(src_repo_path)
+        dest_norm = _normalize_repo_path(dest_repo_path)
+        print(
+            f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=begin",
+            flush=True,
+        )
+        try:
+            items = list(
+                self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=src_norm,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=True,
+                    token=token,
+                )
+            )
+        except RemoteEntryNotFoundError:
+            print(
+                f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
+                flush=True,
+            )
+            return
+
+        file_paths: list[str] = []
+        for item in items:
+            path = getattr(item, "path", "")
+            if not path:
+                continue
+            if _is_directory_item(item):
+                continue
+            file_paths.append(path)
+
+        if CommitOperationAdd is None or CommitOperationDelete is None or not hasattr(self.api, "create_commit"):
+            # Fallback: copy then delete folder (two commits at least)
+            self.copy_folder(mount_root, src_norm, dest_norm)
+            self.delete_path(mount_root, src_norm, is_dir=True)
+            self.invalidate_mount_cache(mount_root)
+            print(
+                f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} status=ok-fallback",
+                flush=True,
+            )
+            return
+
+        ops = []
+        for src_file_path in file_paths:
+            if src_norm:
+                relative_path = src_file_path[len(src_norm) :].lstrip("/")
+            else:
+                relative_path = src_file_path
+            dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
+            local_path = hf_hub_download(
+                repo_id=mount.repo_id,
+                filename=src_file_path,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+            )
+            ops.append(CommitOperationAdd(path_in_repo=dest_file_path, path_or_fileobj=local_path))
+        # Prefer folder delete op if available
+        try:
+            ops.append(CommitOperationDelete(path_in_repo=src_norm, is_folder=True))  # type: ignore[call-arg]
+        except TypeError:
+            # Older signature: delete each file
+            for src_file_path in file_paths:
+                ops.append(CommitOperationDelete(path_in_repo=src_file_path))
+
+        max_ops = int(os.getenv("HF_WEBDAV_MAX_COMMIT_OPS", "200") or "200")
+        committed = 0
+        for i in range(0, len(ops), max_ops):
+            chunk = ops[i : i + max_ops]
+            self.api.create_commit(
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Move folder {src_norm or '/'} to {dest_norm or '/'} via WebDAV gateway",
+                operations=chunk,
+            )
+            committed += len(chunk)
+            if committed < len(ops):
+                print(
+                    f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} committed={committed}",
+                    flush=True,
+                )
+        self.invalidate_mount_cache(mount_root)
+        print(
+            f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={len(file_paths)} commits={(len(ops) + max_ops - 1) // max_ops} status=ok",
             flush=True,
         )
 
@@ -530,7 +683,11 @@ class RepoCollection(DAVCollection):
         return RepoCollection(child_path, self.environ, self.provider, self.mount_root, child_repo_path)
 
     def handle_copy(self, dest_path, *, depth_infinity=False, overwrite=False):
-        """Handle COPY request for a collection (folder)."""
+        """Handle COPY request for a collection (folder).
+
+        Note: GatewayApp handles COPY directly for compatibility. This is kept as a
+        fallback when running without GatewayApp.
+        """
         mount = self.provider.backend.mounts_by_root.get(self.mount_root)
         if mount is None:
             raise DAVError(HTTP_FORBIDDEN, "Source repository not found.")
@@ -567,7 +724,11 @@ class RepoCollection(DAVCollection):
         return True
 
     def handle_move(self, dest_path):
-        """Handle MOVE request for a collection (folder)."""
+        """Handle MOVE request for a collection (folder).
+
+        Note: GatewayApp handles MOVE directly for compatibility. This is kept as a
+        fallback when running without GatewayApp.
+        """
         mount = self.provider.backend.mounts_by_root.get(self.mount_root)
         if mount is None:
             raise DAVError(HTTP_FORBIDDEN, "Source repository not found.")
@@ -588,77 +749,21 @@ class RepoCollection(DAVCollection):
         if dest_mount_root != self.mount_root:
             raise DAVError(HTTP_FORBIDDEN, "Cross-repository move is not supported.")
         
-        # Get all files in the source folder recursively
         try:
-            items = list(self.provider.backend.api.list_repo_tree(
-                repo_id=mount.repo_id,
-                path_in_repo=self.repo_path,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                recursive=True,
-                token=token,
-            ))
-        except Exception as exc:
-            print(f"[webdav-move-error] repo_id={mount.repo_id} path={self.repo_path} error={exc}", flush=True)
-            raise DAVError(HTTP_INTERNAL_ERROR, f"Failed to list source files: {exc}")
-        
-        # Move each file (copy then delete)
-        moved_files = []
-        try:
-            for item in items:
-                src_file_path = getattr(item, "path", "")
-                if not src_file_path:
-                    continue
-                
-                # Calculate destination path for this file
-                if self.repo_path:
-                    relative_path = src_file_path[len(self.repo_path):].lstrip("/")
-                else:
-                    relative_path = src_file_path
-                
-                dest_file_path = f"{dest_repo_path}/{relative_path}" if dest_repo_path else relative_path
-                
-                # Download and re-upload the file
-                local_path = hf_hub_download(
-                    repo_id=mount.repo_id,
-                    filename=src_file_path,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                )
-                with open(local_path, "rb") as f:
-                    data = f.read()
-                
-                self.provider.backend.api.upload_file(
-                    path_or_fileobj=data,
-                    path_in_repo=dest_file_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Move {src_file_path} to {dest_file_path} via WebDAV gateway",
-                )
-                moved_files.append(src_file_path)
-                print(f"[webdav-move] src={src_file_path} dest={dest_file_path} status=copied", flush=True)
-            
-            # Delete source files after successful copy
-            delete_folder = getattr(self.provider.backend.api, "delete_folder", None)
-            if callable(delete_folder):
-                delete_folder(
-                    path_in_repo=self.repo_path,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Delete source folder {self.repo_path} after move via WebDAV gateway",
-                )
-            
-            self.provider.backend.list_dir.cache_clear()
-            print(f"[webdav-move] src={self.repo_path} dest={dest_repo_path} status=completed", flush=True)
-            return True
+            move = getattr(self.provider.backend, "move_folder", None)
+            if callable(move):
+                move(self.mount_root, self.repo_path, dest_repo_path)
+            else:
+                self.provider.backend.copy_folder(self.mount_root, self.repo_path, dest_repo_path)
+                self.provider.backend.delete_path(self.mount_root, self.repo_path, is_dir=True)
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc)) from exc
         except Exception as exc:
             print(f"[webdav-move-error] src={self.repo_path} dest={dest_repo_path} error={exc}", flush=True)
             raise DAVError(HTTP_INTERNAL_ERROR, f"Failed to move: {exc}")
+
+        self.provider.backend.list_dir.cache_clear()
+        return True
 
     def delete(self):
         if not self.repo_path:
