@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import io
 import mimetypes
 import os
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, unquote
 from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import cast
@@ -32,6 +33,11 @@ _provider: HfWebDavProvider | None = None
 _config_path: str | Path = "config.yaml"
 _refresh_interval: int = 300  # 默认 5 分钟
 _current_mounts: tuple[RepoMount, ...] = tuple()  # 当前最新的 mounts
+
+# Windows WebDAV client may fire MKCOL concurrently/repeatedly.
+# Use per-path locks to avoid redundant placeholder commits.
+_mkcol_locks: dict[str, threading.Lock] = {}
+_mkcol_locks_guard = threading.Lock()
 PASSTHROUGH_RESPONSE_HEADERS = {
     "accept-ranges",
     "cache-control",
@@ -81,7 +87,7 @@ def _refresh_loop() -> None:
 
 
 def build_app(config_path: str | Path):
-    global _backend, _provider, _config_path, _refresh_interval
+    global _backend, _provider, _config_path, _refresh_interval, _current_mounts
     
     DISCOVERY_EVENTS.clear()
     REPO_METADATA.clear()
@@ -215,7 +221,12 @@ class GatewayApp:
             if method == "MKCOL":
                 forwarded_path = path[len("/dav") :] or "/"
                 if self._handle_mkcol(forwarded_path, start_response):
-                    return []
+                    return getattr(self, '_mkcol_response', [])
+
+            if method == "COPY":
+                forwarded_path = path[len("/dav") :] or "/"
+                if self._handle_copy(forwarded_path, environ, start_response):
+                    return getattr(self, "_copy_response", [])
 
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
@@ -507,18 +518,300 @@ class GatewayApp:
         return True
 
     def _handle_mkcol(self, forwarded_path: str, start_response) -> bool:
+        """Handle MKCOL (create collection/folder) request directly.
+        
+        HuggingFace Hub doesn't support empty folders, so we create a .gitkeep placeholder file.
+        This method handles all MKCOL requests directly instead of passing to wsgidav,
+        because wsgidav's existence checks can cause issues with HF API caching delays.
+        
+        Returns True if handled, False to passthrough to wsgidav.
+        Response body is stored in _mkcol_response if needed.
+        """
         normalized = (forwarded_path or "/").rstrip("/") or "/"
-        # 动态计算 repo_roots
+        
+        # Parse path to get mount info
+        parts = tuple(part for part in normalized.strip("/").split("/") if part)
+        
+        # Debug: log parsed path info
+        print(f"[webdav-mkcol-debug] normalized={normalized} parts={parts} backend_exists={_backend is not None} mounts_count={len(_current_mounts)}", flush=True)
+        
+        if len(parts) < 4:
+            # Do not allow MKCOL outside repository paths.
+            # Returning 405 prevents Windows Explorer from looping on virtual paths.
+            print(f"[webdav-mkcol] path={normalized} status=not-allowed", flush=True)
+            start_response("405 Method Not Allowed", [("Content-Length", "0")])
+            return True
+        
+        # Check if this is a repository root
         repo_roots = {
             f"/{mount.repo_id.split('/', 1)[0]}/{mount.repo_type}s/{mount.repo_id.split('/', 1)[1]}".rstrip("/")
             for mount in _current_mounts
         }
-        if normalized in repo_roots or any(normalized.startswith(root + "/") for root in repo_roots):
-            print(f"[webdav-mkcol] path={normalized} status=idempotent-ok", flush=True)
+        if normalized in repo_roots:
+            # Repository roots already exist. Some clients expect MKCOL to be idempotent.
+            print(f"[webdav-mkcol] path={normalized} status=already-exists", flush=True)
             start_response("201 Created", [("Content-Length", "0")])
             return True
-        print(f"[webdav-mkcol] path={normalized} status=passthrough", flush=True)
-        return False
+        
+        # Find the mount for this path using backend's mounts_by_root
+        mount_root = (parts[0], parts[1], parts[2])
+        mount = None
+        
+        # First try using backend's mounts_by_root for faster lookup
+        if _backend is not None:
+            mount = _backend.mounts_by_root.get(mount_root)
+            if mount is None:
+                # Debug: log available keys
+                available_roots = list(_backend.mounts_by_root.keys())[:5]
+                print(f"[webdav-mkcol-debug] mount_root={mount_root} available_roots={available_roots}", flush=True)
+        
+        # Fallback to searching _current_mounts
+        if mount is None:
+            for m in _current_mounts:
+                m_root = (m.repo_id.split('/', 1)[0], f"{m.repo_type}s", m.repo_id.split('/', 1)[1])
+                if m_root == mount_root:
+                    mount = m
+                    break
+        
+        if mount is None:
+            # Repository not found - return error instead of passthrough
+            # This prevents infinite loops
+            print(f"[webdav-mkcol-error] path={normalized} mount_root={mount_root} current_mounts_count={len(_current_mounts)} reason=repo-not-found", flush=True)
+            body = b"Repository not found\n"
+            start_response("404 Not Found", [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body)))
+            ])
+            self._mkcol_response = [body]
+            return True
+        
+        # Get token
+        token = _token_for_mount(mount)
+        if not token:
+            print(f"[webdav-mkcol-error] path={normalized} reason=missing-token", flush=True)
+            body = b"Creating folders requires a token-backed repository entry\n"
+            start_response("403 Forbidden", [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body)))
+            ])
+            self._mkcol_response = [body]
+            return True
+        
+        # Calculate folder path within repo
+        folder_path = "/".join(parts[3:]) if len(parts) > 3 else ""
+
+        placeholder_name = os.getenv("HF_WEBDAV_PLACEHOLDER_FILE", ".gitkeep").strip() or ".gitkeep"
+        placeholder_path = f"{folder_path}/{placeholder_name}" if folder_path else placeholder_name
+
+        lock_key = f"{mount.repo_type}:{mount.repo_id}:{mount.revision}:{folder_path}"
+        with _mkcol_locks_guard:
+            lock = _mkcol_locks.get(lock_key)
+            if lock is None:
+                lock = threading.Lock()
+                _mkcol_locks[lock_key] = lock
+
+        # Create the folder by uploading a placeholder file.
+        # Note: Due to hiding the placeholder in listings, backend existence checks may be
+        # inconsistent for placeholder-only folders. We treat the upstream conflict as the
+        # authoritative "already exists" signal.
+        with lock:
+            try:
+                if _backend is not None:
+                    # Avoid returning 201 for obvious existing directories.
+                    _backend.list_dir.cache_clear()
+                    existing = _backend.get_entry(mount_root, folder_path)
+                    if existing is not None and existing.is_dir:
+                        print(
+                            f"[webdav-mkcol] repo_id={mount.repo_id} path={folder_path or '/'} status=already-exists",
+                            flush=True,
+                        )
+                        start_response("201 Created", [("Content-Length", "0")])
+                        self._mkcol_response = []
+                        return True
+
+                api = HfApi(token=token)
+                api.upload_file(
+                    path_or_fileobj=io.BytesIO(b""),
+                    path_in_repo=placeholder_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Create folder {folder_path or '/'} via WebDAV gateway",
+                )
+
+                if _backend is not None:
+                    # Make the new directory visible immediately for follow-up PROPFIND.
+                    mark = getattr(_backend, "mark_dir_created", None)
+                    if callable(mark):
+                        mark(mount_root, folder_path)
+                    _backend.list_dir.cache_clear()
+
+                print(f"[webdav-mkcol] repo_id={mount.repo_id} path={folder_path or '/'} status=created", flush=True)
+                start_response("201 Created", [("Content-Length", "0")])
+                self._mkcol_response = []
+                return True
+
+            except Exception as exc:
+                # If placeholder already exists, treat MKCOL as idempotent success.
+                message = str(exc).lower()
+                if "already exists" in message or "409" in message or "conflict" in message:
+                    print(
+                        f"[webdav-mkcol] repo_id={mount.repo_id} path={folder_path or '/'} status=already-exists",
+                        flush=True,
+                    )
+                    start_response("201 Created", [("Content-Length", "0")])
+                    self._mkcol_response = []
+                    return True
+                print(
+                    f"[webdav-mkcol-error] repo_id={mount.repo_id} path={folder_path or '/'} error={exc}",
+                    flush=True,
+                )
+                body = f"Failed to create folder: {exc}\n".encode("utf-8")
+                start_response(
+                    "500 Internal Server Error",
+                    [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+                )
+                self._mkcol_response = [body]
+                return True
+
+    def _handle_copy(self, forwarded_path: str, environ, start_response) -> bool:
+        """Handle COPY request directly for repository paths.
+
+        Some clients (e.g. openlist) rely on COPY for folder copy and may retry
+        aggressively when the server implementation is incomplete.
+        """
+        if _backend is None:
+            return False
+
+        raw_src = forwarded_path or "/"
+        src_normalized = (raw_src or "/").lstrip("/")
+        src_parts = tuple(part for part in src_normalized.split("/") if part)
+        if len(src_parts) < 4:
+            return False
+
+        mount_root = (src_parts[0], src_parts[1], src_parts[2])
+        mount = _backend.mounts_by_root.get(mount_root)
+        if mount is None:
+            return False
+
+        token = _token_for_mount(mount)
+        if not token:
+            body = b"Copy requires a token-backed repository entry\n"
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            return True
+
+        dest_header = environ.get("HTTP_DESTINATION", "") or ""
+        dest_path = _normalize_destination_path(dest_header)
+        if not dest_path:
+            body = b"Missing Destination header\n"
+            start_response(
+                "400 Bad Request",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            return True
+
+        # Destination is expected to include /dav prefix. Strip it.
+        if dest_path.startswith("/dav/"):
+            dest_forwarded = dest_path[len("/dav") :]
+        elif dest_path == "/dav":
+            dest_forwarded = "/"
+        else:
+            dest_forwarded = dest_path
+
+        dest_parts = tuple(part for part in dest_forwarded.strip("/").split("/") if part)
+        if len(dest_parts) < 4:
+            body = b"Invalid Destination path\n"
+            start_response(
+                "400 Bad Request",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            return True
+
+        dest_mount_root = (dest_parts[0], dest_parts[1], dest_parts[2])
+        if dest_mount_root != mount_root:
+            body = b"Cross-repository copy is not supported\n"
+            start_response(
+                "403 Forbidden",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            return True
+
+        src_repo_path = "/".join(src_parts[3:])
+        dest_repo_path = "/".join(dest_parts[3:])
+        overwrite = (environ.get("HTTP_OVERWRITE", "") or "").strip().upper() != "F"
+
+        print(
+            "[webdav-copy-request] "
+            f"repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} overwrite={overwrite} destination={dest_header}",
+            flush=True,
+        )
+
+        # Precondition check when overwrite is disabled.
+        if not overwrite:
+            existing = _backend.get_entry(mount_root, dest_repo_path)
+            if existing is not None:
+                body = b"Destination exists and overwrite is disabled\n"
+                start_response(
+                    "412 Precondition Failed",
+                    [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+                )
+                self._copy_response = [body]
+                return True
+
+        try:
+            # Treat trailing slash as a hint that the source is a collection.
+            src_is_collection = (raw_src or "").endswith("/")
+            entry = _backend.get_entry(mount_root, src_repo_path)
+            if entry is not None:
+                src_is_collection = src_is_collection or entry.is_dir
+
+            if src_is_collection:
+                _backend.copy_folder(mount_root, src_repo_path, dest_repo_path)
+            else:
+                # File copy: download then upload.
+                api = HfApi(token=token)
+                url = hf_hub_url(
+                    repo_id=mount.repo_id,
+                    filename=src_repo_path,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                )
+                with urlopen(Request(url, headers={"Authorization": f"Bearer {token}"}), timeout=120) as resp:
+                    data = resp.read()
+                api.upload_file(
+                    path_or_fileobj=data,
+                    path_in_repo=dest_repo_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Copy {src_repo_path} to {dest_repo_path} via WebDAV gateway",
+                )
+
+            start_response("201 Created", [("Content-Length", "0")])
+            self._copy_response = []
+            return True
+        except Exception as exc:
+            print(
+                f"[webdav-copy-error] repo_id={mount.repo_id} src={src_repo_path} dest={dest_repo_path} error={exc}",
+                flush=True,
+            )
+            body = f"Failed to copy: {exc}\n".encode("utf-8")
+            start_response(
+                "500 Internal Server Error",
+                [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            self._copy_response = [body]
+            return True
+
 
     def _maybe_stream_file(self, path: str, method: str, environ, start_response):
         parsed = _parse_dav_file_request(path)
@@ -1122,6 +1415,23 @@ def _stream_upstream_response(upstream, chunk_size: int = 1024 * 256):
             yield chunk
     finally:
         upstream.close()
+
+
+def _normalize_destination_path(value: str) -> str:
+    """Normalize a WebDAV Destination header to an absolute path."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if "://" in text:
+        try:
+            after = text.split("://", 1)[1]
+            idx = after.find("/")
+            text = after[idx:] if idx >= 0 else "/"
+        except Exception:
+            text = "/"
+    if not text.startswith("/"):
+        text = "/" + text
+    return unquote(text)
 
 
 def _load_repo_metadata(api: HfApi, repo_id: str, repo_type: str, token: str | None) -> dict[str, object]:

@@ -7,10 +7,13 @@ import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
+import threading
 from typing import Iterable
+from urllib.parse import unquote
 
 from huggingface_hub import HfApi, hf_hub_download
-from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_METHOD_NOT_ALLOWED
+from huggingface_hub.errors import RemoteEntryNotFoundError
+from wsgidav.dav_error import DAVError, HTTP_BAD_REQUEST, HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, HTTP_METHOD_NOT_ALLOWED
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 
 from hf_webdav_gateway.config import RepoMount
@@ -21,6 +24,8 @@ TYPE_SEGMENTS = {
     "dataset": "datasets",
     "space": "spaces",
 }
+
+PLACEHOLDER_FILE = os.getenv("HF_WEBDAV_PLACEHOLDER_FILE", ".gitkeep").strip() or ".gitkeep"
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,10 @@ class HfGatewayBackend:
         self.records = [_make_mount_record(mount) for mount in mounts]
         self.mounts_by_root = {record.path_parts: record.mount for record in self.records}
         self.children_index = _build_children_index(self.records)
+        # Optimistic directory overlay used to make just-created folders visible
+        # immediately (Windows Explorer issues PROPFIND right after MKCOL).
+        self._optimistic_dirs: dict[tuple[tuple[str, str, str], str], set[str]] = {}
+        self._optimistic_dirs_lock = threading.Lock()
 
     def invalidate_mount_cache(self, mount_root: tuple[str, str, str]) -> None:
         self.list_dir.cache_clear()
@@ -73,28 +82,58 @@ class HfGatewayBackend:
         mount = self.mounts_by_root[mount_root]
         normalized = _normalize_repo_path(repo_path)
         entries: dict[str, EntryInfo] = {}
-        for item in self.api.list_repo_tree(
-            repo_id=mount.repo_id,
-            path_in_repo=normalized,
-            repo_type=mount.repo_type,
-            revision=mount.revision,
-            recursive=False,
-            expand=True,
-            token=self._token_for_mount(mount),
-        ):
-            item_path = getattr(item, "path", "")
-            if not item_path:
-                continue
-            name = PurePosixPath(item_path).name
-            entries[name] = EntryInfo(
-                name=name,
-                repo_path=item_path,
-                is_dir=_is_directory_item(item),
-                size=getattr(item, "size", None),
-                etag=_extract_etag(item),
-                modified=_extract_modified_timestamp(item),
+        try:
+            iterator = self.api.list_repo_tree(
+                repo_id=mount.repo_id,
+                path_in_repo=normalized,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                recursive=False,
+                expand=True,
+                token=self._token_for_mount(mount),
             )
+            for item in iterator:
+                item_path = getattr(item, "path", "")
+                if not item_path:
+                    continue
+                name = PurePosixPath(item_path).name
+                entries[name] = EntryInfo(
+                    name=name,
+                    repo_path=item_path,
+                    is_dir=_is_directory_item(item),
+                    size=getattr(item, "size", None),
+                    etag=_extract_etag(item),
+                    modified=_extract_modified_timestamp(item),
+                )
+        except RemoteEntryNotFoundError:
+            # Missing directory on HF Hub should behave like an empty listing.
+            entries = {}
+
+        # Merge optimistic folders (best-effort).
+        key = (mount_root, normalized)
+        optimistic = self._optimistic_dirs.get(key)
+        if optimistic:
+            for child in sorted(optimistic):
+                if child in entries:
+                    continue
+                child_path = "/".join(part for part in (normalized, child) if part)
+                entries[child] = EntryInfo(name=child, repo_path=child_path, is_dir=True)
         return entries
+
+    def mark_dir_created(self, mount_root: tuple[str, str, str], repo_path: str) -> None:
+        """Record a directory as existing, to avoid immediate client retries."""
+        normalized = _normalize_repo_path(repo_path)
+        if not normalized:
+            return
+        parent = str(PurePosixPath(normalized).parent)
+        if parent == ".":
+            parent = ""
+        name = PurePosixPath(normalized).name
+        key = (mount_root, parent)
+        with self._optimistic_dirs_lock:
+            self._optimistic_dirs.setdefault(key, set()).add(name)
+        # Ensure follow-up list_dir is not served from an old cache entry.
+        self.list_dir.cache_clear()
 
     def get_entry(self, mount_root: tuple[str, str, str], repo_path: str) -> EntryInfo | None:
         normalized = _normalize_repo_path(repo_path)
@@ -176,6 +215,89 @@ class HfGatewayBackend:
                 except OSError:
                     pass
 
+    def copy_folder(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
+        """Recursively copy a folder inside the same repository.
+
+        Note: HF Hub does not provide a server-side folder copy API.
+        We implement it as download + upload.
+        """
+        mount = self.mounts_by_root[mount_root]
+        token = self._token_for_mount(mount)
+        if not token:
+            raise PermissionError("Copying requires a token-backed repository entry.")
+
+        src_norm = _normalize_repo_path(src_repo_path)
+        dest_norm = _normalize_repo_path(dest_repo_path)
+        print(
+            f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=begin",
+            flush=True,
+        )
+
+        try:
+            items = list(
+                self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=src_norm,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=True,
+                    token=token,
+                )
+            )
+        except RemoteEntryNotFoundError:
+            # Source folder missing: treat as no-op.
+            print(
+                f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
+                flush=True,
+            )
+            return
+
+        copied = 0
+        for item in items:
+            src_file_path = getattr(item, "path", "")
+            if not src_file_path:
+                continue
+            if _is_directory_item(item):
+                continue
+
+            if src_norm:
+                relative_path = src_file_path[len(src_norm) :].lstrip("/")
+            else:
+                relative_path = src_file_path
+            dest_file_path = "/".join(part for part in (dest_norm, relative_path) if part)
+
+            local_path = hf_hub_download(
+                repo_id=mount.repo_id,
+                filename=src_file_path,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+            )
+            with open(local_path, "rb") as f:
+                data = f.read()
+
+            self.api.upload_file(
+                path_or_fileobj=data,
+                path_in_repo=dest_file_path,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Copy {src_file_path} to {dest_file_path} via WebDAV gateway",
+            )
+            copied += 1
+            if copied % 50 == 0:
+                print(
+                    f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} copied={copied}",
+                    flush=True,
+                )
+
+        self.invalidate_mount_cache(mount_root)
+        print(
+            f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} files={copied} status=ok",
+            flush=True,
+        )
+
     def delete_path(self, mount_root: tuple[str, str, str], repo_path: str, is_dir: bool) -> None:
         mount = self.mounts_by_root[mount_root]
         token = self._token_for_mount(mount)
@@ -192,26 +314,62 @@ class HfGatewayBackend:
                 delete_folder = getattr(self.api, "delete_folder", None)
                 if not callable(delete_folder):
                     raise NotImplementedError("Directory deletion is not supported by this huggingface_hub version.")
-                delete_folder(
-                    path_in_repo=normalized,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Delete folder {normalized} via WebDAV gateway",
-                )
+                try:
+                    delete_folder(
+                        path_in_repo=normalized,
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Delete folder {normalized} via WebDAV gateway",
+                    )
+                except RemoteEntryNotFoundError:
+                    # Idempotent delete: if it doesn't exist remotely, treat as success.
+                    pass
             else:
                 delete_file = getattr(self.api, "delete_file", None)
                 if not callable(delete_file):
                     raise NotImplementedError("File deletion is not supported by this huggingface_hub version.")
-                delete_file(
-                    path_in_repo=normalized,
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=f"Delete {normalized} via WebDAV gateway",
-                )
+                try:
+                    delete_file(
+                        path_in_repo=normalized,
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=f"Delete {normalized} via WebDAV gateway",
+                    )
+                except RemoteEntryNotFoundError:
+                    # Idempotent delete.
+                    pass
+
+                # If the deleted file was the last entry in its parent directory, HF Hub will
+                # effectively drop that now-empty folder. Windows clients often expect the
+                # folder to remain, so we create a placeholder file to keep it materialized.
+                parent = str(PurePosixPath(normalized).parent)
+                if parent == ".":
+                    parent = ""
+                deleted_name = PurePosixPath(normalized).name
+                if parent and deleted_name != PLACEHOLDER_FILE:
+                    try:
+                        remaining = self.list_dir(mount_root, parent)
+                    except Exception:
+                        remaining = {}
+                    if not remaining:
+                        placeholder_path = f"{parent}/{PLACEHOLDER_FILE}"
+                        try:
+                            self.api.upload_file(
+                                path_or_fileobj=io.BytesIO(b""),
+                                path_in_repo=placeholder_path,
+                                repo_id=mount.repo_id,
+                                repo_type=mount.repo_type,
+                                revision=mount.revision,
+                                token=token,
+                                commit_message=f"Keep folder {parent} via WebDAV gateway",
+                            )
+                        except Exception:
+                            # Best-effort: even if this fails, the delete already succeeded.
+                            pass
             self.invalidate_mount_cache(mount_root)
             print(
                 f"[webdav-delete] repo_id={mount.repo_id} path={normalized} kind={'dir' if is_dir else 'file'} status=ok",
@@ -336,11 +494,171 @@ class RepoCollection(DAVCollection):
         child_path = _child_webdav_path(self.path, name)
         child_repo_path = "/".join(part for part in (self.repo_path, name) if part)
         mount = self.provider.backend.mounts_by_root[self.mount_root]
-        print(
-            f"[webdav-mkcol] repo_id={mount.repo_id} path={child_repo_path or '/'} status=accepted",
-            flush=True,
-        )
+        
+        # HuggingFace Hub doesn't support empty folders - create a placeholder file.
+        token = self.provider.backend._token_for_mount(mount)
+        if token:
+            placeholder_path = f"{child_repo_path}/{PLACEHOLDER_FILE}" if child_repo_path else f"{name}/{PLACEHOLDER_FILE}"
+            try:
+                self.provider.backend.api.upload_file(
+                    path_or_fileobj=io.BytesIO(b""),
+                    path_in_repo=placeholder_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Create folder {child_repo_path} via WebDAV gateway",
+                )
+                self.provider.backend.list_dir.cache_clear()
+                print(
+                    f"[webdav-mkcol] repo_id={mount.repo_id} path={child_repo_path or '/'} status=created",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[webdav-mkcol-error] repo_id={mount.repo_id} path={child_repo_path or '/'} error={exc}",
+                    flush=True,
+                )
+                raise
+        else:
+            print(
+                f"[webdav-mkcol-error] repo_id={mount.repo_id} path={child_repo_path or '/'} reason=missing_token",
+                flush=True,
+            )
+            raise PermissionError("Creating folders requires a token-backed repository entry.")
+        
         return RepoCollection(child_path, self.environ, self.provider, self.mount_root, child_repo_path)
+
+    def handle_copy(self, dest_path, *, depth_infinity=False, overwrite=False):
+        """Handle COPY request for a collection (folder)."""
+        mount = self.provider.backend.mounts_by_root.get(self.mount_root)
+        if mount is None:
+            raise DAVError(HTTP_FORBIDDEN, "Source repository not found.")
+        
+        token = self.provider.backend._token_for_mount(mount)
+        if not token:
+            raise DAVError(HTTP_FORBIDDEN, "Copying requires a token-backed repository entry.")
+        
+        # Parse destination path (may be a full URL)
+        dest_parts = _parse_webdav_dest_path(dest_path)
+        if len(dest_parts) < 4:
+            raise DAVError(HTTP_BAD_REQUEST, "Invalid destination path.")
+        
+        dest_mount_root = (dest_parts[0], dest_parts[1], dest_parts[2])
+        dest_repo_path = "/".join(dest_parts[3:])
+        
+        # Check if source and destination are in the same repo
+        if dest_mount_root != self.mount_root:
+            raise DAVError(HTTP_FORBIDDEN, "Cross-repository copy is not supported.")
+        
+        try:
+            self.provider.backend.copy_folder(self.mount_root, self.repo_path, dest_repo_path)
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc)) from exc
+        except Exception as exc:
+            print(
+                f"[webdav-copy-error] repo_id={mount.repo_id} src={self.repo_path} dest={dest_repo_path} error={exc}",
+                flush=True,
+            )
+            raise DAVError(HTTP_INTERNAL_ERROR, f"Failed to copy folder: {exc}") from exc
+
+        self.provider.backend.list_dir.cache_clear()
+        # Return True means handled, wsgidav will set response.
+        return True
+
+    def handle_move(self, dest_path):
+        """Handle MOVE request for a collection (folder)."""
+        mount = self.provider.backend.mounts_by_root.get(self.mount_root)
+        if mount is None:
+            raise DAVError(HTTP_FORBIDDEN, "Source repository not found.")
+        
+        token = self.provider.backend._token_for_mount(mount)
+        if not token:
+            raise DAVError(HTTP_FORBIDDEN, "Moving requires a token-backed repository entry.")
+        
+        # Parse destination path (may be a full URL)
+        dest_parts = _parse_webdav_dest_path(dest_path)
+        if len(dest_parts) < 4:
+            raise DAVError(HTTP_BAD_REQUEST, "Invalid destination path.")
+        
+        dest_mount_root = (dest_parts[0], dest_parts[1], dest_parts[2])
+        dest_repo_path = "/".join(dest_parts[3:])
+        
+        # Check if source and destination are in the same repo
+        if dest_mount_root != self.mount_root:
+            raise DAVError(HTTP_FORBIDDEN, "Cross-repository move is not supported.")
+        
+        # Get all files in the source folder recursively
+        try:
+            items = list(self.provider.backend.api.list_repo_tree(
+                repo_id=mount.repo_id,
+                path_in_repo=self.repo_path,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                recursive=True,
+                token=token,
+            ))
+        except Exception as exc:
+            print(f"[webdav-move-error] repo_id={mount.repo_id} path={self.repo_path} error={exc}", flush=True)
+            raise DAVError(HTTP_INTERNAL_ERROR, f"Failed to list source files: {exc}")
+        
+        # Move each file (copy then delete)
+        moved_files = []
+        try:
+            for item in items:
+                src_file_path = getattr(item, "path", "")
+                if not src_file_path:
+                    continue
+                
+                # Calculate destination path for this file
+                if self.repo_path:
+                    relative_path = src_file_path[len(self.repo_path):].lstrip("/")
+                else:
+                    relative_path = src_file_path
+                
+                dest_file_path = f"{dest_repo_path}/{relative_path}" if dest_repo_path else relative_path
+                
+                # Download and re-upload the file
+                local_path = hf_hub_download(
+                    repo_id=mount.repo_id,
+                    filename=src_file_path,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                )
+                with open(local_path, "rb") as f:
+                    data = f.read()
+                
+                self.provider.backend.api.upload_file(
+                    path_or_fileobj=data,
+                    path_in_repo=dest_file_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Move {src_file_path} to {dest_file_path} via WebDAV gateway",
+                )
+                moved_files.append(src_file_path)
+                print(f"[webdav-move] src={src_file_path} dest={dest_file_path} status=copied", flush=True)
+            
+            # Delete source files after successful copy
+            delete_folder = getattr(self.provider.backend.api, "delete_folder", None)
+            if callable(delete_folder):
+                delete_folder(
+                    path_in_repo=self.repo_path,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Delete source folder {self.repo_path} after move via WebDAV gateway",
+                )
+            
+            self.provider.backend.list_dir.cache_clear()
+            print(f"[webdav-move] src={self.repo_path} dest={dest_repo_path} status=completed", flush=True)
+            return True
+        except Exception as exc:
+            print(f"[webdav-move-error] src={self.repo_path} dest={dest_repo_path} error={exc}", flush=True)
+            raise DAVError(HTTP_INTERNAL_ERROR, f"Failed to move: {exc}")
 
     def delete(self):
         if not self.repo_path:
@@ -453,6 +771,28 @@ def _normalize_repo_path(repo_path: str) -> str:
 def _child_webdav_path(parent: str, name: str) -> str:
     base = parent.rstrip("/")
     return f"{base}/{name}" if base else f"/{name}"
+
+
+def _parse_webdav_dest_path(dest_path: str) -> tuple[str, ...]:
+    """Parse Destination header value into path segments.
+
+    wsgidav may pass an absolute URL (e.g. http://host/dav/u/models/r/file)
+    or a raw path. We only need the path portion.
+    """
+    text = (dest_path or "").strip()
+    if "://" in text:
+        # crude but sufficient: split at first '/' after scheme+host
+        try:
+            after = text.split("://", 1)[1]
+            idx = after.find("/")
+            text = after[idx:] if idx >= 0 else "/"
+        except Exception:
+            text = "/"
+    text = unquote(text)
+    parts = tuple(part for part in text.strip("/").split("/") if part)
+    if parts and parts[0] == "dav":
+        parts = parts[1:]
+    return parts
 
 
 def _is_directory_item(item) -> bool:
