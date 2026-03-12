@@ -181,7 +181,9 @@ def build_app(config_path: str | Path):
 
     dav_app = WsgiDAVApp(
         {
-            "provider_mapping": {"/": _provider},
+            # Mount provider under /dav so WsgiDAV generates hrefs
+            # that include the /dav prefix (rclone expects this).
+            "provider_mapping": {"/dav": _provider},
             # 配置 simple_dc 允许写入
             "simple_dc": {
                 "user_mapping": {
@@ -307,12 +309,11 @@ class GatewayApp:
                 if self._handle_move(forwarded_path, environ, start_response):
                     return getattr(self, "_move_response", [])
 
+            # Pass through the original PATH_INFO (which already starts with
+            # /dav/...) so WsgiDAV can resolve the share and generate correct
+            # <href> values. Only inject REMOTE_USER for auth.
             forwarded = dict(environ)
             forwarded["REMOTE_USER"] = self.username
-            forwarded["SCRIPT_NAME"] = f"{environ.get('SCRIPT_NAME', '')}/dav".rstrip("/")
-            forwarded_path = _strip_dav_prefix(path)
-            forwarded["PATH_INFO"] = _to_wsgi_path(forwarded_path)
-            
             return self.dav_app(forwarded, start_response)
 
         body = b"Not Found\n"
