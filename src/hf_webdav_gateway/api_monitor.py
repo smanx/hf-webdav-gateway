@@ -51,6 +51,7 @@ class ApiMonitor:
         self._records: deque[ApiCallRecord] = deque(maxlen=max_records)
         self._stats = ApiStats()
         self._lock = threading.Lock()
+        self._start_time: float = time.time()  # System start time
 
     def record_call(
         self,
@@ -127,12 +128,16 @@ class ApiMonitor:
         if self._stats.last_refresh_time:
             last_refresh_ago = time.time() - self._stats.last_refresh_time
 
+        # Calculate system uptime
+        uptime_seconds = time.time() - self._start_time
+
         return {
             "summary": {
                 "total_calls": self._stats.total_calls,
                 "total_429_errors": self._stats.total_429_errors,
                 "total_errors": self._stats.total_errors,
                 "last_refresh_ago_seconds": last_refresh_ago,
+                "uptime_seconds": uptime_seconds,
             },
             "by_api": dict(self._stats.calls_by_api),
             "errors_429_by_api": dict(self._stats.errors_429_by_api),
@@ -167,15 +172,15 @@ class ApiMonitor:
             err_str = f" ({err_429} x 429)" if err_429 else ""
             api_rows.append(f"<tr><td>{api_name}</td><td>{count}{err_str}</td></tr>")
 
-        # Build recent calls section
+        # Build recent calls section (all calls, JS will handle display count)
         recent_rows = []
-        for r in recent[:50]:  # Last 50 calls (most recent first)
+        for i, r in enumerate(recent):
             ts = datetime.fromtimestamp(r["timestamp"]).strftime("%H:%M:%S")
             repo = r["repo_id"] or "-"
             status_class = "status-error" if r["status"] != "ok" else "status-ok"
             status_str = r["status"] if r["status"] != "ok" else ""
             recent_rows.append(
-                f"<tr class='{status_class}'>"
+                f"<tr class='{status_class}' data-index='{i}'>"
                 f"<td>{ts}</td><td>{r['api']}</td><td>{repo}</td><td>{r['source']}</td>"
                 f"<td>{r['duration_ms']:.0f}ms</td><td>{status_str}</td>"
                 f"</tr>"
@@ -191,6 +196,19 @@ class ApiMonitor:
                 last_refresh = f"{secs // 60}m ago"
             else:
                 last_refresh = f"{secs // 3600}h {(secs % 3600) // 60}m ago"
+
+        # System uptime
+        uptime_seconds = int(summary.get("uptime_seconds", 0))
+        if uptime_seconds < 60:
+            uptime = f"{uptime_seconds}s"
+        elif uptime_seconds < 3600:
+            uptime = f"{uptime_seconds // 60}m {uptime_seconds % 60}s"
+        elif uptime_seconds < 86400:
+            uptime = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m"
+        else:
+            days = uptime_seconds // 86400
+            hours = (uptime_seconds % 86400) // 3600
+            uptime = f"{days}d {hours}h"
 
         return f"""<!doctype html>
 <html>
@@ -218,14 +236,14 @@ class ApiMonitor:
     }}
     .container {{ max-width: 1000px; margin: 0 auto; }}
     h1 {{ margin: 0 0 24px; font-size: 1.5rem; }}
-    .grid {{ display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); margin-bottom: 24px; }}
+    .grid {{ display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 24px; }}
     .card {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 16px;
     }}
-    .card-value {{ font-size: 2rem; font-weight: 600; }}
+    .card-value {{ font-size: 1.75rem; font-weight: 600; }}
     .card-label {{ color: var(--muted); font-size: 0.875rem; }}
     .card.error {{ border-color: rgba(220, 38, 38, 0.3); }}
     .card.error .card-value {{ color: var(--error); }}
@@ -236,7 +254,21 @@ class ApiMonitor:
     .status-ok {{ }}
     code {{ font-family: "SF Mono", Consolas, monospace; font-size: 0.875em; }}
     .section {{ margin-bottom: 24px; }}
-    .section-title {{ font-size: 0.875rem; font-weight: 600; color: var(--accent); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }}
+    .section-header {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }}
+    .section-title {{ font-size: 0.875rem; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.05em; }}
+    .page-control {{ display: flex; align-items: center; gap: 8px; }}
+    .page-control label {{ font-size: 0.875rem; color: var(--muted); }}
+    .page-control select {{
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--ink);
+      font-size: 0.875rem;
+      cursor: pointer;
+    }}
+    .page-control select:focus {{ outline: none; border-color: var(--accent); }}
+    .hidden {{ display: none; }}
   </style>
 </head>
 <body>
@@ -244,6 +276,10 @@ class ApiMonitor:
     <h1>API Call Statistics</h1>
     
     <div class="grid">
+      <div class="card">
+        <div class="card-value">{uptime}</div>
+        <div class="card-label">Uptime</div>
+      </div>
       <div class="card">
         <div class="card-value">{summary['total_calls']}</div>
         <div class="card-label">Total Calls</div>
@@ -271,13 +307,43 @@ class ApiMonitor:
     </div>
 
     <div class="section">
-      <div class="section-title">Recent Calls (newest first, max 50)</div>
-      <table>
+      <div class="section-header">
+        <div class="section-title">Recent Calls (newest first)</div>
+        <div class="page-control">
+          <label for="pageSize">Show:</label>
+          <select id="pageSize" onchange="updatePageSize()">
+            <option value="20">20</option>
+            <option value="50" selected>50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="all">All ({len(recent)})</option>
+          </select>
+        </div>
+      </div>
+      <table id="recentTable">
         <tr><th>Time</th><th>API</th><th>Repo</th><th>Source</th><th>Duration</th><th>Status</th></tr>
         {''.join(recent_rows)}
       </table>
     </div>
   </div>
+  <script>
+    function updatePageSize() {{
+      const select = document.getElementById('pageSize');
+      const value = select.value;
+      const rows = document.querySelectorAll('#recentTable tr[data-index]');
+      const total = rows.length;
+      const limit = value === 'all' ? total : parseInt(value, 10);
+      
+      rows.forEach((row, i) => {{
+        if (i < limit) {{
+          row.classList.remove('hidden');
+        }} else {{
+          row.classList.add('hidden');
+        }}
+      }});
+    }}
+    updatePageSize();
+  </script>
 </body>
 </html>
 """
