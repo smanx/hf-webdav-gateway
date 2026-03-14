@@ -17,6 +17,8 @@ from huggingface_hub.errors import RemoteEntryNotFoundError
 from wsgidav.dav_error import DAVError, HTTP_BAD_REQUEST, HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, HTTP_METHOD_NOT_ALLOWED
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 
+from hf_webdav_gateway.api_monitor import track_api_call
+
 try:
     # Optional: batch commit API (preferred for large COPY/MOVE)
     from huggingface_hub import CommitOperationAdd, CommitOperationDelete  # type: ignore
@@ -142,19 +144,20 @@ class HfGatewayBackend:
 
         if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
             try:
-                self.api.create_commit(
-                    repo_id=mount.repo_id,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    token=token,
-                    commit_message=commit_message,
-                    operations=[
-                        CommitOperationAdd(
-                            path_in_repo=path_in_repo,
-                            path_or_fileobj=self._get_empty_file_path(),
-                        )
-                    ],
-                )
+                with track_api_call("create_commit", "mkcol", repo_id=mount.repo_id):
+                    self.api.create_commit(
+                        repo_id=mount.repo_id,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        token=token,
+                        commit_message=commit_message,
+                        operations=[
+                            CommitOperationAdd(
+                                path_in_repo=path_in_repo,
+                                path_or_fileobj=self._get_empty_file_path(),
+                            )
+                        ],
+                    )
                 return
             except Exception as exc:
                 if _is_conflict_error(exc):
@@ -163,16 +166,17 @@ class HfGatewayBackend:
 
         # Fallback: upload_file
         try:
-            self.api.upload_file(
-                # Use a stable local empty file path for best compatibility.
-                path_or_fileobj=self._get_empty_file_path(),
-                path_in_repo=path_in_repo,
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=commit_message,
-            )
+            with track_api_call("upload_file", "mkcol", repo_id=mount.repo_id):
+                self.api.upload_file(
+                    # Use a stable local empty file path for best compatibility.
+                    path_or_fileobj=self._get_empty_file_path(),
+                    path_in_repo=path_in_repo,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=commit_message,
+                )
         except Exception as exc:
             if _is_conflict_error(exc):
                 return
@@ -192,28 +196,29 @@ class HfGatewayBackend:
         normalized = _normalize_repo_path(repo_path)
         entries: dict[str, EntryInfo] = {}
         try:
-            iterator = self.api.list_repo_tree(
-                repo_id=mount.repo_id,
-                path_in_repo=normalized,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                recursive=False,
-                expand=True,
-                token=self._token_for_mount(mount),
-            )
-            for item in iterator:
-                item_path = getattr(item, "path", "")
-                if not item_path:
-                    continue
-                name = PurePosixPath(item_path).name
-                entries[name] = EntryInfo(
-                    name=name,
-                    repo_path=item_path,
-                    is_dir=_is_directory_item(item),
-                    size=getattr(item, "size", None),
-                    etag=_extract_etag(item),
-                    modified=_extract_modified_timestamp(item),
+            with track_api_call("list_repo_tree", "propfind", repo_id=mount.repo_id):
+                iterator = self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=normalized,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=False,
+                    expand=True,
+                    token=self._token_for_mount(mount),
                 )
+                for item in iterator:
+                    item_path = getattr(item, "path", "")
+                    if not item_path:
+                        continue
+                    name = PurePosixPath(item_path).name
+                    entries[name] = EntryInfo(
+                        name=name,
+                        repo_path=item_path,
+                        is_dir=_is_directory_item(item),
+                        size=getattr(item, "size", None),
+                        etag=_extract_etag(item),
+                        modified=_extract_modified_timestamp(item),
+                    )
         except RemoteEntryNotFoundError:
             # Missing directory on HF Hub should behave like an empty listing.
             entries = {}
@@ -273,13 +278,14 @@ class HfGatewayBackend:
             f"[webdav-get] repo_id={mount.repo_id} path={normalized} status=begin",
             flush=True,
         )
-        local_path = hf_hub_download(
-            repo_id=mount.repo_id,
-            filename=normalized,
-            repo_type=mount.repo_type,
-            revision=mount.revision,
-            token=self._token_for_mount(mount),
-        )
+        with track_api_call("hf_hub_download", "file_download", repo_id=mount.repo_id):
+            local_path = hf_hub_download(
+                repo_id=mount.repo_id,
+                filename=normalized,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=self._token_for_mount(mount),
+            )
         print(
             f"[webdav-get] repo_id={mount.repo_id} path={normalized} status=ok local_path={local_path}",
             flush=True,
@@ -309,15 +315,16 @@ class HfGatewayBackend:
                 f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=uploading",
                 flush=True,
             )
-            self.api.upload_file(
-                path_or_fileobj=temp_path,
-                path_in_repo=normalized,
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=f"Update {normalized} via WebDAV gateway",
-            )
+            with track_api_call("upload_file", "file_upload", repo_id=mount.repo_id):
+                self.api.upload_file(
+                    path_or_fileobj=temp_path,
+                    path_in_repo=normalized,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Update {normalized} via WebDAV gateway",
+                )
             self.invalidate_mount_cache(mount_root)
             print(
                 f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=ok",
@@ -355,14 +362,15 @@ class HfGatewayBackend:
         )
 
         try:
-            iterator = self.api.list_repo_tree(
-                repo_id=mount.repo_id,
-                path_in_repo=src_norm,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                recursive=True,
-                token=token,
-            )
+            with track_api_call("list_repo_tree", "folder_copy", repo_id=mount.repo_id):
+                iterator = list(self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=src_norm,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=True,
+                    token=token,
+                ))
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
@@ -448,14 +456,15 @@ class HfGatewayBackend:
         # Fallback: per-file upload (slower, more commits)
         copied = 0
         try:
-            iterator = self.api.list_repo_tree(
-                repo_id=mount.repo_id,
-                path_in_repo=src_norm,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                recursive=True,
-                token=token,
-            )
+            with track_api_call("list_repo_tree", "folder_copy", repo_id=mount.repo_id):
+                iterator = list(self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=src_norm,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=True,
+                    token=token,
+                ))
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
@@ -517,33 +526,36 @@ class HfGatewayBackend:
         if src_norm == dest_norm:
             return
 
-        local_path = hf_hub_download(
-            repo_id=mount.repo_id,
-            filename=src_norm,
-            repo_type=mount.repo_type,
-            revision=mount.revision,
-            token=token,
-        )
+        with track_api_call("hf_hub_download", "file_copy", repo_id=mount.repo_id):
+            local_path = hf_hub_download(
+                repo_id=mount.repo_id,
+                filename=src_norm,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+            )
 
         if CommitOperationAdd is not None and hasattr(self.api, "create_commit"):
-            self.api.create_commit(
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
-                operations=[CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path)],
-            )
+            with track_api_call("create_commit", "file_copy", repo_id=mount.repo_id):
+                self.api.create_commit(
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
+                    operations=[CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path)],
+                )
         else:
-            self.api.upload_file(
-                path_or_fileobj=local_path,
-                path_in_repo=dest_norm,
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
-            )
+            with track_api_call("upload_file", "file_copy", repo_id=mount.repo_id):
+                self.api.upload_file(
+                    path_or_fileobj=local_path,
+                    path_in_repo=dest_norm,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Copy {src_norm} to {dest_norm} via WebDAV gateway",
+                )
 
         self.invalidate_mount_cache(mount_root)
 
@@ -564,36 +576,39 @@ class HfGatewayBackend:
         if src_norm == dest_norm:
             return
 
-        local_path = hf_hub_download(
-            repo_id=mount.repo_id,
-            filename=src_norm,
-            repo_type=mount.repo_type,
-            revision=mount.revision,
-            token=token,
-        )
+        with track_api_call("hf_hub_download", "file_move", repo_id=mount.repo_id):
+            local_path = hf_hub_download(
+                repo_id=mount.repo_id,
+                filename=src_norm,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+            )
 
         if CommitOperationAdd is not None and CommitOperationDelete is not None and hasattr(self.api, "create_commit"):
-            self.api.create_commit(
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
-                operations=[
-                    CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path),
-                    CommitOperationDelete(path_in_repo=src_norm),
-                ],
-            )
+            with track_api_call("create_commit", "file_move", repo_id=mount.repo_id):
+                self.api.create_commit(
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
+                    operations=[
+                        CommitOperationAdd(path_in_repo=dest_norm, path_or_fileobj=local_path),
+                        CommitOperationDelete(path_in_repo=src_norm),
+                    ],
+                )
         else:
-            self.api.upload_file(
-                path_or_fileobj=local_path,
-                path_in_repo=dest_norm,
-                repo_id=mount.repo_id,
-                repo_type=mount.repo_type,
-                revision=mount.revision,
-                token=token,
-                commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
-            )
+            with track_api_call("upload_file", "file_move", repo_id=mount.repo_id):
+                self.api.upload_file(
+                    path_or_fileobj=local_path,
+                    path_in_repo=dest_norm,
+                    repo_id=mount.repo_id,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    token=token,
+                    commit_message=f"Move {src_norm} to {dest_norm} via WebDAV gateway",
+                )
             self.delete_path(mount_root, src_norm, is_dir=False)
 
         self.invalidate_mount_cache(mount_root)
@@ -627,16 +642,17 @@ class HfGatewayBackend:
             flush=True,
         )
         try:
-            items = list(
-                self.api.list_repo_tree(
-                    repo_id=mount.repo_id,
-                    path_in_repo=src_norm,
-                    repo_type=mount.repo_type,
-                    revision=mount.revision,
-                    recursive=True,
-                    token=token,
+            with track_api_call("list_repo_tree", "folder_move", repo_id=mount.repo_id):
+                items = list(
+                    self.api.list_repo_tree(
+                        repo_id=mount.repo_id,
+                        path_in_repo=src_norm,
+                        repo_type=mount.repo_type,
+                        revision=mount.revision,
+                        recursive=True,
+                        token=token,
+                    )
                 )
-            )
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",

@@ -26,6 +26,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 
 from hf_webdav_gateway.config import GatewayConfig, RepoMount, load_config
 from hf_webdav_gateway.provider import HfGatewayBackend, HfWebDavProvider
+from hf_webdav_gateway.api_monitor import get_monitor, track_api_call
 
 
 DISCOVERY_EVENTS: list[dict[str, object]] = []
@@ -136,6 +137,9 @@ def _refresh_mounts() -> tuple[RepoMount, ...]:
         
         # 更新全局 mounts
         _current_mounts = tuple(mounts)
+        
+        # 标记刷新时间
+        get_monitor().mark_refresh()
         
         total = len(mounts)
         print(f"[refresh] status=ok repos={total}", flush=True)
@@ -278,6 +282,8 @@ class GatewayApp:
                 [("Content-Type", "text/plain; charset=utf-8"), ("Content-Length", str(len(body)))],
             )
             return [body]
+        if path == "/api-stats":
+            return self._serve_api_stats(environ, start_response)
         if path.startswith("/dav"):
             if method in {"PROPFIND", "GET", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}:
                 print(f"[webdav-request] method={method} path={path}", flush=True)
@@ -593,6 +599,33 @@ class GatewayApp:
             [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))],
         )
         return [body]
+
+    def _serve_api_stats(self, environ, start_response):
+        """Serve the API statistics page."""
+        # Require authentication
+        if self._auth_enabled() and not self._is_authorized(environ):
+            return self._unauthorized(start_response)
+        
+        # Check if JSON format requested
+        query = parse_qs(environ.get("QUERY_STRING", "") or "")
+        fmt = query.get("format", ["html"])[0].lower()
+        
+        if fmt == "json":
+            body = get_monitor().get_stats()
+            import json
+            body_bytes = json.dumps(body, indent=2, ensure_ascii=False).encode("utf-8")
+            start_response(
+                "200 OK",
+                [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(body_bytes)))],
+            )
+            return [body_bytes]
+        else:
+            body = get_monitor().get_stats_html().encode("utf-8")
+            start_response(
+                "200 OK",
+                [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))],
+            )
+            return [body]
 
     def _auth_enabled(self) -> bool:
         return True
@@ -1572,7 +1605,8 @@ def _discover_user_mounts(user_entries: tuple[dict[str, str], ...]) -> list[Repo
             token = raw_value
             api = HfApi(token=token)
             try:
-                token_identity = api.whoami(token=token)
+                with track_api_call("whoami", "repo_discovery"):
+                    token_identity = api.whoami(token=token)
                 token_user = str(token_identity.get("name", "")).strip()
                 if token_user:
                     username = token_user
@@ -1644,12 +1678,15 @@ def _discover_user_mounts(user_entries: tuple[dict[str, str], ...]) -> list[Repo
 
         try:
             discovered_counts = {"model": 0, "dataset": 0, "space": 0}
-            for repo_type, iterator in (
-                ("model", api.list_models(author=username, token=token)),
-                ("dataset", api.list_datasets(author=username, token=token)),
-                ("space", api.list_spaces(author=username, token=token)),
+            for repo_type, api_name, iterator in (
+                ("model", "list_models", api.list_models(author=username, token=token)),
+                ("dataset", "list_datasets", api.list_datasets(author=username, token=token)),
+                ("space", "list_spaces", api.list_spaces(author=username, token=token)),
             ):
-                for item in iterator:
+                # Materialize iterator with monitoring
+                with track_api_call(api_name, "repo_discovery"):
+                    items = list(iterator)
+                for item in items:
                     repo_id = str(getattr(item, "id", "")).strip()
                     if not repo_id:
                         continue
@@ -1823,7 +1860,8 @@ def _is_conflict_error(exc: Exception) -> bool:
 def _load_repo_metadata(api: HfApi, repo_id: str, repo_type: str, token: str | None) -> dict[str, object]:
     metadata: dict[str, object] = {"runtime_stage": "-", "repo_size": "-"}
     try:
-        info = api.repo_info(repo_id=repo_id, repo_type=repo_type, token=token, expand=["usedStorage"])
+        with track_api_call("repo_info", "metadata_load", repo_id=repo_id):
+            info = api.repo_info(repo_id=repo_id, repo_type=repo_type, token=token, expand=["usedStorage"])
         used_storage = getattr(info, "usedStorage", None)
         if used_storage in (None, ""):
             siblings = getattr(info, "siblings", None) or []
@@ -1840,7 +1878,8 @@ def _load_repo_metadata(api: HfApi, repo_id: str, repo_type: str, token: str | N
 
     if repo_type == "space":
         try:
-            runtime = api.get_space_runtime(repo_id, token=token)
+            with track_api_call("get_space_runtime", "metadata_load", repo_id=repo_id):
+                runtime = api.get_space_runtime(repo_id, token=token)
             metadata["runtime_stage"] = str(getattr(runtime, "stage", "-") or "-")
         except Exception as exc:
             print(f"[repo-metadata-warning] repo_id={repo_id} field=runtime error={exc}", flush=True)
