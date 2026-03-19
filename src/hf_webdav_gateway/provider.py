@@ -297,6 +297,7 @@ class HfGatewayBackend:
         return content_type or "application/octet-stream"
 
     def write_file(self, mount_root: tuple[str, str, str], repo_path: str, data: bytes) -> None:
+        """Write file content from bytes (for small files)."""
         mount = self.mounts_by_root[mount_root]
         normalized = _normalize_repo_path(repo_path)
         token = self._token_for_mount(mount)
@@ -306,18 +307,56 @@ class HfGatewayBackend:
                 flush=True,
             )
             raise PermissionError("Writing requires a token-backed repository entry.")
-        temp_path = ""
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-                temp_file.write(data)
-                temp_path = temp_file.name
+        print(
+            f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=uploading",
+            flush=True,
+        )
+        with track_api_call("upload_file", "file_upload", repo_id=mount.repo_id):
+            self.api.upload_file(
+                path_or_fileobj=data,
+                path_in_repo=normalized,
+                repo_id=mount.repo_id,
+                repo_type=mount.repo_type,
+                revision=mount.revision,
+                token=token,
+                commit_message=f"Update {normalized} via WebDAV gateway",
+            )
+        self.invalidate_mount_cache(mount_root)
+        print(
+            f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=ok",
+            flush=True,
+        )
+
+    def write_file_from_path(self, mount_root: tuple[str, str, str], repo_path: str, local_path: str) -> None:
+        """Write file content from a local file path (streaming, memory-efficient for large files).
+
+        This method is used for large file uploads to avoid loading the entire file into memory.
+        """
+        mount = self.mounts_by_root[mount_root]
+        normalized = _normalize_repo_path(repo_path)
+        token = self._token_for_mount(mount)
+        if not token:
             print(
-                f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=uploading",
+                f"[webdav-put-error] repo_id={mount.repo_id} path={normalized} reason=missing_token",
                 flush=True,
             )
+            raise PermissionError("Writing requires a token-backed repository entry.")
+
+        # Get file size for logging
+        file_size = 0
+        try:
+            file_size = os.path.getsize(local_path)
+        except OSError:
+            pass
+
+        print(
+            f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={file_size} status=uploading",
+            flush=True,
+        )
+        try:
             with track_api_call("upload_file", "file_upload", repo_id=mount.repo_id):
                 self.api.upload_file(
-                    path_or_fileobj=temp_path,
+                    path_or_fileobj=local_path,
                     path_in_repo=normalized,
                     repo_id=mount.repo_id,
                     repo_type=mount.repo_type,
@@ -327,7 +366,7 @@ class HfGatewayBackend:
                 )
             self.invalidate_mount_cache(mount_root)
             print(
-                f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={len(data)} status=ok",
+                f"[webdav-put] repo_id={mount.repo_id} path={normalized} bytes={file_size} status=ok",
                 flush=True,
             )
         except Exception as exc:
@@ -336,12 +375,6 @@ class HfGatewayBackend:
                 flush=True,
             )
             raise
-        finally:
-            if temp_path:
-                try:
-                    os.remove(temp_path)
-                except OSError:
-                    pass
 
     def copy_folder(self, mount_root: tuple[str, str, str], src_repo_path: str, dest_repo_path: str) -> None:
         """Recursively copy a folder inside the same repository.
@@ -363,14 +396,14 @@ class HfGatewayBackend:
 
         try:
             with track_api_call("list_repo_tree", "folder_copy", repo_id=mount.repo_id):
-                iterator = list(self.api.list_repo_tree(
+                iterator = self.api.list_repo_tree(
                     repo_id=mount.repo_id,
                     path_in_repo=src_norm,
                     repo_type=mount.repo_type,
                     revision=mount.revision,
                     recursive=True,
                     token=token,
-                ))
+                )
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
@@ -457,14 +490,14 @@ class HfGatewayBackend:
         copied = 0
         try:
             with track_api_call("list_repo_tree", "folder_copy", repo_id=mount.repo_id):
-                iterator = list(self.api.list_repo_tree(
+                iterator = self.api.list_repo_tree(
                     repo_id=mount.repo_id,
                     path_in_repo=src_norm,
                     repo_type=mount.repo_type,
                     revision=mount.revision,
                     recursive=True,
                     token=token,
-                ))
+                )
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-copy-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
@@ -641,33 +674,31 @@ class HfGatewayBackend:
             f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=begin",
             flush=True,
         )
+        
+        # First pass: collect file paths (lightweight, only strings)
+        file_paths: list[str] = []
         try:
             with track_api_call("list_repo_tree", "folder_move", repo_id=mount.repo_id):
-                items = list(
-                    self.api.list_repo_tree(
-                        repo_id=mount.repo_id,
-                        path_in_repo=src_norm,
-                        repo_type=mount.repo_type,
-                        revision=mount.revision,
-                        recursive=True,
-                        token=token,
-                    )
-                )
+                for item in self.api.list_repo_tree(
+                    repo_id=mount.repo_id,
+                    path_in_repo=src_norm,
+                    repo_type=mount.repo_type,
+                    revision=mount.revision,
+                    recursive=True,
+                    token=token,
+                ):
+                    path = getattr(item, "path", "")
+                    if not path:
+                        continue
+                    if _is_directory_item(item):
+                        continue
+                    file_paths.append(path)
         except RemoteEntryNotFoundError:
             print(
                 f"[webdav-move-folder] repo_id={mount.repo_id} src={src_norm or '/'} dest={dest_norm or '/'} status=missing-src",
                 flush=True,
             )
             return
-
-        file_paths: list[str] = []
-        for item in items:
-            path = getattr(item, "path", "")
-            if not path:
-                continue
-            if _is_directory_item(item):
-                continue
-            file_paths.append(path)
 
         if CommitOperationAdd is None or CommitOperationDelete is None or not hasattr(self.api, "create_commit"):
             # Fallback: copy then delete folder (two commits at least)
@@ -1110,24 +1141,53 @@ class RepoFile(DAVNonCollection):
             raise DAVError(HTTP_METHOD_NOT_ALLOWED, str(exc)) from exc
 
 
-class _UploadBuffer(io.BytesIO):
+class _UploadBuffer(io.BufferedWriter):
+    """A file-like buffer that streams uploads to a temp file, avoiding memory blowup.
+
+    Instead of buffering the entire upload in memory (which causes OOM for large files),
+    this class writes directly to a temporary file and streams it to HuggingFace Hub.
+    """
+
     def __init__(self, backend: HfGatewayBackend, mount_root: tuple[str, str, str], repo_path: str) -> None:
-        super().__init__()
         self._backend = backend
         self._mount_root = mount_root
         self._repo_path = repo_path
         self._closed = False
+        self._temp_file = tempfile.NamedTemporaryFile(
+            mode='wb',
+            delete=False,
+            prefix='hf-webdav-upload-',
+            suffix='.tmp'
+        )
+        self._temp_path = self._temp_file.name
+        super().__init__(self._temp_file)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        data = self.getvalue()
-        super().close()
+
+        # Flush and close the temp file first
         try:
-            self._backend.write_file(self._mount_root, self._repo_path, data)
+            self.flush()
+        except Exception:
+            pass
+        try:
+            self._temp_file.close()
+        except Exception:
+            pass
+
+        # Upload from the temp file path (avoids reading entire file into memory)
+        try:
+            self._backend.write_file_from_path(self._mount_root, self._repo_path, self._temp_path)
         except Exception:
             raise
+        finally:
+            # Clean up the temp file
+            try:
+                os.remove(self._temp_path)
+            except OSError:
+                pass
 
 
 def _make_mount_record(mount: RepoMount) -> MountRecord:

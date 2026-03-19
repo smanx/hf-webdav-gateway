@@ -49,9 +49,28 @@ _mkcol_locks_guard = threading.Lock()
 _mkcol_lock_last_used: dict[str, float] = {}
 _mkcol_locks_last_gc = 0.0
 
+# 刷新锁，保护并发刷新
+_refresh_lock = threading.Lock()
+_last_refresh_time: float = 0.0
+_refresh_cooldown = 30.0  # 刷新冷却时间（秒），避免频繁刷新
+
 _longop_lock = threading.Semaphore(int(os.getenv("HF_WEBDAV_LONGOP_CONCURRENCY", "2") or "2"))
-_longop_dedupe: set[str] = set()
+_longop_dedupe: dict[str, float] = {}  # op_key -> timestamp
 _longop_dedupe_guard = threading.Lock()
+_longop_dedupe_last_gc = 0.0
+_LONGOP_DEDUPE_TTL = 300.0  # 5 minutes TTL for dedupe entries
+
+
+def _gc_longop_dedupe() -> None:
+    """清理过期的 _longop_dedupe 条目"""
+    global _longop_dedupe_last_gc
+    now = time.time()
+    if now - _longop_dedupe_last_gc < 60:  # 每分钟最多清理一次
+        return
+    _longop_dedupe_last_gc = now
+    expired = [k for k, ts in _longop_dedupe.items() if now - ts > _LONGOP_DEDUPE_TTL]
+    for k in expired:
+        _longop_dedupe.pop(k, None)
 
 
 def _normalize_repo_path_for_key(path: str) -> str:
@@ -118,13 +137,34 @@ PASSTHROUGH_RESPONSE_HEADERS = {
 
 
 def _refresh_mounts() -> tuple[RepoMount, ...]:
-    """刷新仓库列表，返回最新的 mounts"""
-    global _backend, _provider, DISCOVERY_EVENTS, REPO_METADATA, _current_mounts
+    """刷新仓库列表，返回最新的 mounts
+    
+    使用锁保护并发刷新，并检查冷却时间避免频繁刷新。
+    """
+    global _backend, _provider, DISCOVERY_EVENTS, REPO_METADATA, _current_mounts, _last_refresh_time
     
     if _backend is None:
         return _current_mounts
     
+    # 检查冷却时间，避免频繁刷新
+    now = time.time()
+    if now - _last_refresh_time < _refresh_cooldown:
+        return _current_mounts
+    
+    # 尝试获取锁，如果已有刷新在进行则直接返回
+    if not _refresh_lock.acquire(blocking=False):
+        return _current_mounts
+    
     try:
+        # 再次检查冷却时间（可能在等待锁期间已被其他线程刷新）
+        now = time.time()
+        if now - _last_refresh_time < _refresh_cooldown:
+            return _current_mounts
+        
+        # 清空旧数据，防止无限增长
+        DISCOVERY_EVENTS.clear()
+        REPO_METADATA.clear()
+        
         config = load_config(_config_path)
         mounts = _resolve_mounts(config)
         
@@ -138,6 +178,9 @@ def _refresh_mounts() -> tuple[RepoMount, ...]:
         # 更新全局 mounts
         _current_mounts = tuple(mounts)
         
+        # 更新刷新时间
+        _last_refresh_time = time.time()
+        
         # 标记刷新时间
         get_monitor().mark_refresh()
         
@@ -147,6 +190,8 @@ def _refresh_mounts() -> tuple[RepoMount, ...]:
     except Exception as exc:
         print(f"[refresh-error] error={exc}", flush=True)
         return _current_mounts
+    finally:
+        _refresh_lock.release()
 
 
 def _refresh_loop() -> None:
@@ -330,9 +375,7 @@ class GatewayApp:
         return [body]
 
     def _serve_home(self, environ, start_response):
-        # 访问首页时刷新仓库列表
-        _refresh_mounts()
-        
+        # 使用后台刷新的结果，不在此处同步刷新，避免阻塞请求
         language = _detect_language(environ)
         text = _get_home_text(language)
         title = cast(str, text["title"])
@@ -884,13 +927,14 @@ class GatewayApp:
             f"copy:{mount.repo_type}:{mount.repo_id}:{mount.revision}:"
             f"{_normalize_repo_path_for_key(src_repo_path)}->{_normalize_repo_path_for_key(dest_repo_path)}:{int(overwrite)}"
         )
+        _gc_longop_dedupe()
         with _longop_dedupe_guard:
             if op_key in _longop_dedupe:
                 start_response("201 Created", [("Content-Length", "0")])
                 self._copy_response = []
                 print(f"[webdav-copy-request] id={request_id} status=deduped", flush=True)
                 return True
-            _longop_dedupe.add(op_key)
+            _longop_dedupe[op_key] = time.time()
 
         t0 = time.time()
         _longop_lock.acquire()
@@ -972,7 +1016,7 @@ class GatewayApp:
         finally:
             _longop_lock.release()
             with _longop_dedupe_guard:
-                _longop_dedupe.discard(op_key)
+                _longop_dedupe.pop(op_key, None)
 
     def _handle_delete(self, forwarded_path: str, environ, start_response) -> bool:
         """Handle DELETE directly for repository paths."""
@@ -1132,13 +1176,14 @@ class GatewayApp:
             f"move:{mount.repo_type}:{mount.repo_id}:{mount.revision}:"
             f"{_normalize_repo_path_for_key(src_repo_path)}->{_normalize_repo_path_for_key(dest_repo_path)}:{int(overwrite)}"
         )
+        _gc_longop_dedupe()
         with _longop_dedupe_guard:
             if op_key in _longop_dedupe:
                 start_response("201 Created", [("Content-Length", "0")])
                 self._move_response = []
                 print(f"[webdav-move-request] id={request_id} status=deduped", flush=True)
                 return True
-            _longop_dedupe.add(op_key)
+            _longop_dedupe[op_key] = time.time()
 
         t0 = time.time()
         _longop_lock.acquire()
@@ -1224,7 +1269,7 @@ class GatewayApp:
         finally:
             _longop_lock.release()
             with _longop_dedupe_guard:
-                _longop_dedupe.discard(op_key)
+                _longop_dedupe.pop(op_key, None)
 
 
     def _maybe_stream_file(self, path: str, method: str, environ, start_response):
